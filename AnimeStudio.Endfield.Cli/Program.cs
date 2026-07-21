@@ -2286,7 +2286,7 @@ internal static class Program
         long totalBytes = 0;
         int stage1Extracted = 0;
 
-        // 跨 batch 的文件名占位表，防止重名纹理互相覆盖
+        // 跨 batch 的文件名占位表，防止极端情况下完全相同的标识再次冲突
         var claimedNames = new ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
 
         // ── 内存阀门 & 诊断采样 ──
@@ -2490,6 +2490,7 @@ internal static class Program
                     {
                         Interlocked.Decrement(ref currentChannelBacklog);
                         if (killSwitch.IsCancellationRequested) break;
+                        string bundleHash = Path.GetFileNameWithoutExtension(bundlePath);
                         var swBundle = Stopwatch.StartNew();
                         long allocBefore = (perBundleAllocTrapBytes > 0 || perBundleAllocLimitBytes > 0)
                             ? GC.GetAllocatedBytesForCurrentThread()
@@ -2565,18 +2566,23 @@ internal static class Program
                                                 ? Path.Combine(outPath, ClassifyImage(name))
                                                 : outPath;
 
-                                            // 原子占位：先到先得，重名自动加 PathID 后缀
-                                            string outFile = Path.Combine(targetDir, safeName + ext);
+                                            // 画像名は入力元から決定的に生成する。
+                                            // Bundle hash と PathID を含めることで、同名の低解像度・高解像度画像や
+                                            // 別Bundle内の同名画像が、実行順によって上書きされることを防ぐ。
+                                            string stableStem =
+                                                $"{safeName}__{tex.m_Width}x{tex.m_Height}"
+                                                + $"__p-{tex.m_PathID}__b-{bundleHash}";
+                                            string outFile = Path.Combine(targetDir, stableStem + ext);
                                             if (!claimedNames.TryAdd(outFile, 0))
                                             {
-                                                outFile = Path.Combine(targetDir,
-                                                    $"{safeName}_{tex.m_PathID:x}{ext}");
+                                                // 通常は発生しないが、同一Bundle内で完全に同じ識別子が
+                                                // 現れた場合だけ、追加の連番で衝突を避ける。
+                                                outFile = Path.Combine(targetDir, $"{stableStem}.dup-2{ext}");
                                                 int dup = 2;
                                                 while (!claimedNames.TryAdd(outFile, 0))
                                                 {
-                                                    outFile = Path.Combine(targetDir,
-                                                        $"{safeName}_{tex.m_PathID:x}_{dup}{ext}");
                                                     dup++;
+                                                    outFile = Path.Combine(targetDir, $"{stableStem}.dup-{dup}{ext}");
                                                 }
                                             }
 
