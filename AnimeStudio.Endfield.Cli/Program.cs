@@ -22,10 +22,10 @@ internal static class Program
     private const string Usage =
         """
         Usage:
-          endfield-dump dump    --vfs <streaming_assets_path> --out <dir> [--block <type>...] [--threads N]
-          endfield-dump list    --vfs <streaming_assets_path> [--block <type>...]
-          endfield-dump inspect --vfs <streaming_assets_path> [--limit N] [--min-size N] [--names <regex>]
-          endfield-dump extract --vfs <streaming_assets_path> --out <dir>
+          endfield-dump dump    --vfs <streaming_assets_path> --out <dir> [--base-vfs <base_streaming_assets>] [--block <type>...] [--threads N]
+          endfield-dump list    --vfs <streaming_assets_path> [--base-vfs <base_streaming_assets>] [--block <type>...]
+          endfield-dump inspect --vfs <streaming_assets_path> [--base-vfs <base_streaming_assets>] [--limit N] [--min-size N] [--names <regex>]
+          endfield-dump extract --vfs <streaming_assets_path> --out <dir> [--base-vfs <base_streaming_assets>]
                                 [--bundle-name <regex>] [--asset-name <regex>] [--types <T>...]
                                 [--block <type>...] [--threads N] [--scratch <dir>] [--keep-bundles]
                                 [--format png|bmp|tga] [--png-compression none|fast|default]
@@ -37,7 +37,7 @@ internal static class Program
                                 [--vgmstream <path>] [--ffmpeg <path>]
                                 [--mp3-bitrate 192] [--mp3-quality best|high|medium|low|minimum|0-9]
                                 [--threads N] [--base-vfs <base_streaming_assets>]
-          endfield-dump video   --vfs <streaming_assets_path> --out <dir>
+          endfield-dump video   --vfs <streaming_assets_path> --out <dir> [--base-vfs <base_streaming_assets>]
                                 [--format mp4|usm] [--block all|video|auditvideo]
                                 [--ffmpeg <path>] [--threads N]
 
@@ -106,6 +106,7 @@ internal static class Program
     private sealed class ParsedArgs
     {
         public string? VfsPath;
+        public string? BaseVfsPath;
         public string? OutPath;
         public List<BlockType> Blocks = new();
         public int Threads;
@@ -122,6 +123,9 @@ internal static class Program
                 case "--vfs":
                 case "-s":
                     parsed.VfsPath = RequireValue(args, ref i, a);
+                    break;
+                case "--base-vfs":
+                    parsed.BaseVfsPath = RequireValue(args, ref i, a);
                     break;
                 case "--out":
                 case "-o":
@@ -168,6 +172,7 @@ internal static class Program
     private static int RunList(ReadOnlySpan<string> args)
     {
         string? vfsPath = null;
+        string? baseVfsPath = null;
         var blocks = new List<BlockType>();
         bool listFiles = false;
         for (int i = 0; i < args.Length; i++)
@@ -178,6 +183,9 @@ internal static class Program
                 case "--vfs":
                 case "-s":
                     vfsPath = RequireValue(args, ref i, a);
+                    break;
+                case "--base-vfs":
+                    baseVfsPath = RequireValue(args, ref i, a);
                     break;
                 case "--block":
                 case "-b":
@@ -192,7 +200,7 @@ internal static class Program
         }
         if (vfsPath is null) throw new ArgumentException("--vfs is required");
 
-        var loader = new VfsLoader(vfsPath, Keys.ChaCha20Key);
+        var loader = new VfsLoader(vfsPath, Keys.ChaCha20Key, baseVfsPath);
         var blockEnumerable = blocks.Count > 0 ? blocks : (IEnumerable<BlockType>)BlockTypes.AllDumpable;
 
         foreach (var bt in blockEnumerable)
@@ -235,7 +243,7 @@ internal static class Program
         if (parsed.OutPath is null) throw new ArgumentException("--out is required");
 
         Directory.CreateDirectory(parsed.OutPath);
-        var loader = new VfsLoader(parsed.VfsPath, Keys.ChaCha20Key);
+        var loader = new VfsLoader(parsed.VfsPath, Keys.ChaCha20Key, parsed.BaseVfsPath);
         var blocks = parsed.Blocks.Count > 0 ? parsed.Blocks : (IEnumerable<BlockType>)BlockTypes.AllDumpable;
 
         var parallelOptions = new ParallelOptions
@@ -363,7 +371,7 @@ internal static class Program
         public int? Mp3Vbr;            // VBR 质量等级 0-9（数字越小越好，0≈245kbps, 4≈165kbps, 9≈65kbps）
         public int Threads;
         public Regex? AudioFilter;     // 映射路径正则过滤器（null = 不过滤）
-        public string? BaseVfsPath;    // 基础游戏 StreamingAssets（热更模式下用于回退加载 AudioDialog）
+        public string? BaseVfsPath;    // 基础游戏 StreamingAssets（PersistentにないVFSファイルの回退先）
     }
 
     private enum AudioBlockGroup { All, Audio, InitialAudio, AuditAudio, Voice }
@@ -514,7 +522,7 @@ internal static class Program
 
     private static void RunAudioPipeline(AudioArgs parsed)
     {
-        var loader = new VfsLoader(parsed.VfsPath!, Keys.ChaCha20Key);
+        var loader = new VfsLoader(parsed.VfsPath!, Keys.ChaCha20Key, parsed.BaseVfsPath);
         // 当前生效的输出格式（探测失败会降级到 wem）
         string outFmt = parsed.Format;  // wem | wav | mp3
         bool needVgmstream = outFmt is "wav" or "mp3";
@@ -650,8 +658,7 @@ internal static class Program
         Console.WriteLine("Loading AudioDialog table...");
         string? audioDialogJson = LoadAudioDialog(loader);
 
-        // 热更模式回退：当前 VFS 里 AudioDialog 缺失（增量数据，chunk 不在）时，
-        // 从基础游戏 StreamingAssets 加载完整 AudioDialog（WEM id 跨版本通常稳定）。
+        // 旧形式との互換用。VfsLoaderがすでに基礎VFSへ回退するため、通常はここには到達しない。
         if (audioDialogJson == null && !string.IsNullOrEmpty(parsed.BaseVfsPath))
         {
             Console.WriteLine($"  AudioDialog missing in hot-update, falling back to base game: {parsed.BaseVfsPath}");
@@ -1063,6 +1070,7 @@ internal static class Program
     private sealed class VideoArgs
     {
         public string? VfsPath;
+        public string? BaseVfsPath;
         public string? OutPath;
         public string Format = "mp4";  // mp4 | usm
         public string Block = "all";   // all | video | auditvideo
@@ -1080,6 +1088,9 @@ internal static class Program
             {
                 case "--vfs":
                     parsed.VfsPath = RequireValue(args, ref i, a);
+                    break;
+                case "--base-vfs":
+                    parsed.BaseVfsPath = RequireValue(args, ref i, a);
                     break;
                 case "--out":
                 case "-o":
@@ -1125,7 +1136,7 @@ internal static class Program
 
     private static void RunVideoPipeline(VideoArgs parsed, BlockType[] blocks)
     {
-        var loader = new VfsLoader(parsed.VfsPath!, Keys.ChaCha20Key);
+        var loader = new VfsLoader(parsed.VfsPath!, Keys.ChaCha20Key, parsed.BaseVfsPath);
         bool wantMp4 = parsed.Format == "mp4";
 
         // ffmpeg 探测
@@ -1335,6 +1346,7 @@ internal static class Program
     private static int RunFindBadBundles(ReadOnlySpan<string> args)
     {
         string? vfsPath = null;
+        string? baseVfsPath = null;
         string outDir = "bad-bundles";
         long allocThresholdMb = 200;
         int limit = 0;
@@ -1347,6 +1359,7 @@ internal static class Program
             switch (a)
             {
                 case "--vfs": vfsPath = RequireValue(args, ref i, a); break;
+                case "--base-vfs": baseVfsPath = RequireValue(args, ref i, a); break;
                 case "--out-dir": outDir = RequireValue(args, ref i, a); break;
                 case "--threshold-mb": allocThresholdMb = long.Parse(RequireValue(args, ref i, a)); break;
                 case "--limit": limit = int.Parse(RequireValue(args, ref i, a)); break;
@@ -1358,7 +1371,7 @@ internal static class Program
         if (vfsPath is null) throw new ArgumentException("--vfs is required");
 
         Directory.CreateDirectory(outDir);
-        var loader = new VfsLoader(vfsPath, Keys.ChaCha20Key);
+        var loader = new VfsLoader(vfsPath, Keys.ChaCha20Key, baseVfsPath);
         long allocThresholdBytes = allocThresholdMb * 1024L * 1024L;
         string scratch = Path.Combine(Path.GetTempPath(), "efend-bad-scan");
         Directory.CreateDirectory(scratch);
@@ -1535,6 +1548,7 @@ internal static class Program
     private static int RunClassifyBundles(ReadOnlySpan<string> args)
     {
         string? vfsPath = null;
+        string? baseVfsPath = null;
         string outFile = "bundle-classification.tsv";
 
         for (int i = 0; i < args.Length; i++)
@@ -1543,13 +1557,14 @@ internal static class Program
             switch (a)
             {
                 case "--vfs": vfsPath = RequireValue(args, ref i, a); break;
+                case "--base-vfs": baseVfsPath = RequireValue(args, ref i, a); break;
                 case "--out": outFile = RequireValue(args, ref i, a); break;
                 default: throw new ArgumentException($"Unknown argument: {a}");
             }
         }
         if (vfsPath is null) throw new ArgumentException("--vfs is required");
 
-        var loader = new VfsLoader(vfsPath, Keys.ChaCha20Key);
+        var loader = new VfsLoader(vfsPath, Keys.ChaCha20Key, baseVfsPath);
 
         // 收集所有 bundle
         var allFiles = new List<(BlockType bt, ChunkInfo chunk, AnimeStudio.Endfield.FileInfo file)>();
@@ -1966,6 +1981,7 @@ internal static class Program
     private static int RunInspect(ReadOnlySpan<string> args)
     {
         string? vfsPath = null;
+        string? baseVfsPath = null;
         int limit = 1;
         long minSize = 0;
         string? namesRegex = null;
@@ -1978,6 +1994,7 @@ internal static class Program
             switch (a)
             {
                 case "--vfs": vfsPath = RequireValue(args, ref i, a); break;
+                case "--base-vfs": baseVfsPath = RequireValue(args, ref i, a); break;
                 case "--limit": limit = int.Parse(RequireValue(args, ref i, a)); break;
                 case "--min-size": minSize = long.Parse(RequireValue(args, ref i, a)); break;
                 case "--names": namesRegex = RequireValue(args, ref i, a); break;
@@ -1993,7 +2010,7 @@ internal static class Program
         if (Directory.Exists(scratch)) Directory.Delete(scratch, recursive: true);
         Directory.CreateDirectory(scratch);
 
-        var loader = new VfsLoader(vfsPath, Keys.ChaCha20Key);
+        var loader = new VfsLoader(vfsPath, Keys.ChaCha20Key, baseVfsPath);
 
         // Stage 1: collect candidate (chunk, file) pairs across selected blocks,
         // optionally filter by minimum size, then sort by size (largest first).
@@ -2096,6 +2113,7 @@ internal static class Program
     private static async Task<int> RunExtract(string[] args)
     {
         string? vfsPath = null;
+        string? baseVfsPath = null;
         string? outPath = null;
         string? bundleNameRegex = null;
         string? assetNameRegex = null;
@@ -2126,6 +2144,7 @@ internal static class Program
             switch (a)
             {
                 case "--vfs": vfsPath = RequireValue(args, ref i, a); break;
+                case "--base-vfs": baseVfsPath = RequireValue(args, ref i, a); break;
                 case "--out": outPath = RequireValue(args, ref i, a); break;
                 case "--bundle-name": bundleNameRegex = RequireValue(args, ref i, a); break;
                 case "--asset-name":
@@ -2204,7 +2223,7 @@ internal static class Program
         long perBundleAllocTrapBytes = perBundleAllocTrapMb * 1024L * 1024L;
         long trappedBundleCount = 0;
 
-        var loader = new VfsLoader(vfsPath, Keys.ChaCha20Key);
+        var loader = new VfsLoader(vfsPath, Keys.ChaCha20Key, baseVfsPath);
         var bundleRx = bundleNameRegex is null ? null : new Regex(bundleNameRegex, RegexOptions.Compiled);
         var assetRx = assetNameRegex is null ? null : new Regex(assetNameRegex, RegexOptions.Compiled);
 

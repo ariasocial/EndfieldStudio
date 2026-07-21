@@ -4,16 +4,19 @@ namespace AnimeStudio.Endfield;
 
 /// <summary>
 /// VFS block loader: reads encrypted .blc and .chk files from the
-/// StreamingAssets/VFS folder. Faithful port of fluffy-dumper/vfs/src/loader.rs.
+/// primary VFS folder, optionally falling back to a base VFS folder.
+/// This matches the game's hot-update layout, where Persistent contains
+/// updated metadata and only some of the referenced chunks.
 /// </summary>
 public sealed class VfsLoader
 {
     private const string VfsDir = "VFS";
 
     private readonly string _vfsPath;
+    private readonly string? _fallbackVfsPath;
     private readonly byte[] _chachaKey;
 
-    public VfsLoader(string streamingAssetsPath, byte[] chacha20Key)
+    public VfsLoader(string streamingAssetsPath, byte[] chacha20Key, string? baseStreamingAssetsPath = null)
     {
         if (streamingAssetsPath is null) throw new ArgumentNullException(nameof(streamingAssetsPath));
         if (chacha20Key is null) throw new ArgumentNullException(nameof(chacha20Key));
@@ -21,22 +24,20 @@ public sealed class VfsLoader
             throw new ArgumentException("ChaCha20 key must be 32 bytes", nameof(chacha20Key));
 
         _vfsPath = Path.Combine(streamingAssetsPath, VfsDir);
+        _fallbackVfsPath = string.IsNullOrWhiteSpace(baseStreamingAssetsPath)
+            ? null
+            : Path.Combine(baseStreamingAssetsPath, VfsDir);
         _chachaKey = (byte[])chacha20Key.Clone();
     }
 
     public string VfsPath => _vfsPath;
 
+    public string? FallbackVfsPath => _fallbackVfsPath;
+
     public BlockMainInfo LoadBlockInfo(BlockType bt)
     {
         string dirName = BlockHashes.GetDirName(bt);
-        string blockDir = Path.Combine(_vfsPath, dirName);
-
-        if (!Directory.Exists(blockDir))
-        {
-            throw new DirectoryNotFoundException($"block directory not found: {dirName}");
-        }
-
-        string blockFilePath = Path.Combine(blockDir, dirName + ".blc");
+        string blockFilePath = ResolveBlockFilePath(dirName);
         byte[] blockData = File.ReadAllBytes(blockFilePath);
 
         if (blockData.Length < Keys.BlockHeadLen)
@@ -57,19 +58,52 @@ public sealed class VfsLoader
         return VfsParser.Parse(decrypted, verifyCrc: true);
     }
 
+    private string ResolveBlockFilePath(string dirName)
+    {
+        string primaryDir = Path.Combine(_vfsPath, dirName);
+        string primaryPath = Path.Combine(primaryDir, dirName + ".blc");
+        if (File.Exists(primaryPath)) return primaryPath;
+
+        if (_fallbackVfsPath is not null)
+        {
+            string fallbackPath = Path.Combine(_fallbackVfsPath, dirName, dirName + ".blc");
+            if (File.Exists(fallbackPath)) return fallbackPath;
+        }
+
+        bool primaryDirExists = Directory.Exists(primaryDir);
+        bool fallbackDirExists = _fallbackVfsPath is not null
+            && Directory.Exists(Path.Combine(_fallbackVfsPath, dirName));
+        if (!primaryDirExists && !fallbackDirExists)
+            throw new DirectoryNotFoundException($"block directory not found: {dirName}");
+
+        throw new FileNotFoundException($"block metadata file not found: {dirName}.blc", primaryPath);
+    }
+
+    private string ResolveChunkPath(BlockType bt, string chunkFileName)
+    {
+        string dirName = BlockHashes.GetDirName(bt);
+        string primaryPath = Path.Combine(_vfsPath, dirName, chunkFileName);
+        if (File.Exists(primaryPath)) return primaryPath;
+
+        if (_fallbackVfsPath is not null)
+        {
+            string fallbackPath = Path.Combine(_fallbackVfsPath, dirName, chunkFileName);
+            if (File.Exists(fallbackPath)) return fallbackPath;
+        }
+
+        string searched = _fallbackVfsPath is null
+            ? primaryPath
+            : $"{primaryPath}; fallback: {Path.Combine(_fallbackVfsPath, dirName, chunkFileName)}";
+        throw new FileNotFoundException($"chunk file not found: {chunkFileName} (searched {searched})", primaryPath);
+    }
+
     public long ExtractFile(BlockType bt, ChunkInfo chunk, FileInfo file, Stream writer)
     {
         if (chunk is null) throw new ArgumentNullException(nameof(chunk));
         if (file is null) throw new ArgumentNullException(nameof(file));
         if (writer is null) throw new ArgumentNullException(nameof(writer));
 
-        string dirName = BlockHashes.GetDirName(bt);
-        string chunkPath = Path.Combine(_vfsPath, dirName, chunk.FileName());
-
-        if (!File.Exists(chunkPath))
-        {
-            throw new FileNotFoundException($"chunk file not found: {chunk.FileName()}", chunkPath);
-        }
+        string chunkPath = ResolveChunkPath(bt, chunk.FileName());
 
         using var stream = new FileStream(
             chunkPath,
