@@ -101,18 +101,18 @@ internal static class DialogExporter
         {
             string dialogId = options.DialogId.Trim();
             string? snapshotTimestamp = options.Snapshot ? DateTime.Now.ToString("yyyyMMddHHmmss", CultureInfo.InvariantCulture) : null;
-            int written = 0;
+            int languageFilesWritten = 0;
             foreach (string language in languages)
             {
                 var dialogs = BuildDialogs(tableSet, language, timelineEvidence);
                 if (!dialogs.TryGetValue(dialogId, out var payload))
                     continue;
                 WriteDialog(options.OutPath, dialogId, language, payload, snapshotTimestamp);
-                written++;
+                languageFilesWritten++;
             }
-            if (written == 0)
+            if (languageFilesWritten == 0)
                 throw new ArgumentException($"Dialog not found: {dialogId}");
-            Console.WriteLine($"  Wrote {written:N0} language file(s) for dialog: {dialogId}");
+            Console.WriteLine($"  Wrote {languageFilesWritten:N0} language file(s) for dialog: {dialogId}");
             return 0;
         }
 
