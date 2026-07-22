@@ -655,7 +655,7 @@ internal static class DialogExporter
         string? id = raw switch
         {
             JsonObject obj => StringOrNull(obj, "id") ?? StringOrNull(obj, "key"),
-            JsonValue value => ScalarString(value),
+            JsonValue numericValue => ScalarString(numericValue),
             _ => null,
         };
         if (string.IsNullOrWhiteSpace(id)) return null;
