@@ -10,9 +10,9 @@ namespace AnimeStudio.Endfield.Cli;
 /// <summary>
 /// Builds one JSON document per DialogTextTable scene.
 ///
-/// This is intentionally the first, table-backed stage of the dialog export
-/// pipeline. It preserves the source rows and labels the numeric row order as
-/// a fallback until Timeline/DialogTree recovery is added.
+/// The export is table-backed and augments the source rows with Timeline
+/// evidence when available. Numeric row order remains the documented fallback
+/// when a matching Timeline cannot be recovered.
 /// </summary>
 internal static class DialogExporter
 {
@@ -67,6 +67,7 @@ internal static class DialogExporter
 
         Directory.CreateDirectory(options.OutPath);
         var tableSet = LoadTables(options);
+        var languages = ResolveLanguages(options.Language, tableSet);
         Dictionary<string, JsonArray> timelineEvidence = new(StringComparer.OrdinalIgnoreCase);
         try
         {
@@ -96,17 +97,22 @@ internal static class DialogExporter
             tableSet.Warnings.Add($"Timeline scan failed; table-backed export was retained: {ex.Message}");
         }
 
-        var dialogs = BuildDialogs(tableSet, options.Language, timelineEvidence);
-
         if (!string.IsNullOrWhiteSpace(options.DialogId))
         {
             string dialogId = options.DialogId.Trim();
-            if (!dialogs.TryGetValue(dialogId, out var payload))
-                throw new ArgumentException($"Dialog not found: {dialogId}");
-
             string? snapshotTimestamp = options.Snapshot ? DateTime.Now.ToString("yyyyMMddHHmmss", CultureInfo.InvariantCulture) : null;
-            WriteDialog(options.OutPath, dialogId, options.Language, payload, snapshotTimestamp);
-            Console.WriteLine($"  Wrote 1 dialog: {dialogId}");
+            int written = 0;
+            foreach (string language in languages)
+            {
+                var dialogs = BuildDialogs(tableSet, language, timelineEvidence);
+                if (!dialogs.TryGetValue(dialogId, out var payload))
+                    continue;
+                WriteDialog(options.OutPath, dialogId, language, payload, snapshotTimestamp);
+                written++;
+            }
+            if (written == 0)
+                throw new ArgumentException($"Dialog not found: {dialogId}");
+            Console.WriteLine($"  Wrote {written:N0} language file(s) for dialog: {dialogId}");
             return 0;
         }
 
@@ -114,13 +120,17 @@ internal static class DialogExporter
             ? DateTime.Now.ToString("yyyyMMddHHmmss", CultureInfo.InvariantCulture)
             : null;
         int written = 0;
-        foreach (var (dialogId, payload) in dialogs.OrderBy(pair => pair.Key, StringComparer.Ordinal))
+        foreach (string language in languages)
         {
-            WriteDialog(options.OutPath, dialogId, options.Language, payload, allSnapshotTimestamp);
-            written++;
+            var dialogs = BuildDialogs(tableSet, language, timelineEvidence);
+            foreach (var (dialogId, payload) in dialogs.OrderBy(pair => pair.Key, StringComparer.Ordinal))
+            {
+                WriteDialog(options.OutPath, dialogId, language, payload, allSnapshotTimestamp);
+                written++;
+            }
         }
 
-        Console.WriteLine($"  Wrote {written:N0} dialogs to {Path.GetFullPath(options.OutPath)}");
+        Console.WriteLine($"  Wrote {written:N0} language file(s) to {Path.GetFullPath(options.OutPath)}");
         if (tableSet.Warnings.Count > 0)
             Console.WriteLine($"  Warnings: {tableSet.Warnings.Count:N0}");
         return 0;
@@ -166,7 +176,7 @@ internal static class DialogExporter
         Console.WriteLine();
         Console.WriteLine("Options:");
         Console.WriteLine("  --base-vfs <path>    Base VFS used for hot-update fallback");
-        Console.WriteLine("  --language <code>    Localization code (default: CN)");
+        Console.WriteLine("  --language <code|all> Localization code (default: CN; all=every available language)");
         Console.WriteLine("  --dialog <id>        Export one dialog instead of all dialogs");
         Console.WriteLine("  --snapshot           Write <language>_snapshot<timestamp>.json");
     }
@@ -185,9 +195,12 @@ internal static class DialogExporter
         }
         LoadTableSource(primary, "primary", result);
 
-        string i18nName = $"I18nTextTable_{options.Language}";
-        if (!result.Tables.ContainsKey(i18nName))
-            result.Warnings.Add($"Localization table not found: {i18nName}");
+        if (!string.Equals(options.Language, "ALL", StringComparison.OrdinalIgnoreCase))
+        {
+            string i18nName = $"I18nTextTable_{options.Language}";
+            if (!result.Tables.ContainsKey(i18nName))
+                result.Warnings.Add($"Localization table not found: {i18nName}");
+        }
         foreach (string tableName in RequiredTables)
         {
             if (!result.Tables.ContainsKey(tableName))
@@ -195,6 +208,24 @@ internal static class DialogExporter
         }
 
         return result;
+    }
+
+    private static List<string> ResolveLanguages(string requested, TableSet tableSet)
+    {
+        if (!string.Equals(requested, "ALL", StringComparison.OrdinalIgnoreCase))
+            return new List<string> { requested };
+
+        const string prefix = "I18nTextTable_";
+        var languages = tableSet.Tables.Keys
+            .Where(name => name.StartsWith(prefix, StringComparison.Ordinal))
+            .Select(name => name[prefix.Length..])
+            .Where(code => Regex.IsMatch(code, @"^[A-Z]{2,8}$", RegexOptions.CultureInvariant))
+            .Distinct(StringComparer.Ordinal)
+            .OrderBy(code => code, StringComparer.Ordinal)
+            .ToList();
+        if (languages.Count == 0)
+            throw new InvalidOperationException("No localization tables were found for --language all");
+        return languages;
     }
 
     private static void LoadTableSource(VfsLoader loader, string sourceName, TableSet result)

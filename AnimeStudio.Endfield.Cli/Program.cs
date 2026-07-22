@@ -32,7 +32,7 @@ internal static class Program
                                 [--max-memory-gb N] [--no-chunk-batching]
                                 [--exclude-material] [--classify]
           endfield-dump dialog  --vfs <vfs_path> --out <dir> [--base-vfs <base_vfs_path>]
-                                [--language <code>] [--dialog <id>] [--snapshot]
+                                [--language <code|all>] [--dialog <id>] [--snapshot]
           endfield-dump audio   --vfs <streaming_assets_path> --out <dir>
                                 [--language all|chinese|english|japanese|korean]
                                 [--format wem|wav|mp3] [--block all|audio|initialaudio|auditaudio|voice]
