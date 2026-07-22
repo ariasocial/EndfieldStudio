@@ -30,7 +30,10 @@ Built on top of [Escartem/AnimeStudio](https://github.com/Escartem/AnimeStudio),
 ### Dialog export
 
 - **Dialog JSON**: Export `DialogTextTable` scenes with localized text, speaker data, summaries, options, mission-name lookup, and source evidence
-- **Timeline evidence**: Recover line order from serialized Unity Timeline track/clip data when IDs match `DialogTextTable`; retain confidence and source warnings
+- **Numeric localization IDs**: Resolve the numeric IDs used by `TextTable` / `I18nTextTable_*`, including mission names, actors, line text, hints, options, and summaries
+- **Timeline evidence**: Recover line order from serialized Unity Timeline track/clip data when IDs match `DialogTextTable`; duplicate lip-sync/placeholder clips are collapsed with the selected source retained
+- **DialogTree evidence**: Read authored `TextAsset` graphs, preserve graph order, option branch routes, and source object IDs; branch-specific routes are kept as evidence rather than flattened into a false global order
+- **Runtime Jump evidence**: Preserve option-indexed jump clips and jump flags under `sources.runtimeJump` for route auditing
 - **Hot-update merge**: Read Persistent first and merge StreamingAssets as the base VFS
 
 ### Lua
@@ -344,11 +347,24 @@ endfield-dump inspect --vfs ./StreamingAssets --limit 50
 | --------- | -------------------------------------------------------------------------------- |
 | `list`    | List all BlockTypes with chunk/file counts                                       |
 | `dump`    | Stage 1 decrypt to disk (Lua auto post-processed, Table→JSON, USM→raw, rest raw) |
-| `dialog`  | Export localized DialogTextTable scenes as one JSON file per dialog         |
+| `dialog`  | Export localized DialogTextTable scenes as one JSON file per dialog, with Timeline/DialogTree evidence |
 | `inspect` | Parse bundle internal object type distribution (for research)                    |
 | `extract` | Stage 1 + 2 + 3 full pipeline, regex-export images                               |
 | `audio`   | Extract Wwise audio (WEM / WAV / MP3) with AudioDialog path mapping              |
 | `video`   | Extract videos (USM / MP4) via native demuxer + ffmpeg                           |
+
+### dialog Options
+
+| Option                 | Default  | Description |
+| ---------------------- | -------- | ----------- |
+| `--vfs <path>`         | required | Persistent VFS directory; use `--base-vfs` for StreamingAssets fallback |
+| `--base-vfs <path>`    | none     | Base VFS used to resolve files shared with the hot-update |
+| `--out <dir>`          | required | Output root; writes `<out>/<dialogId>/<language>.json` |
+| `--language <code>`    | CN       | Language code such as `JP`, `CN`, `EN`, or `all` |
+| `--dialog <id>`        | all      | Export only one dialog, for example `dlg_e7m3_3` |
+| `--snapshot`           | false    | Write `<language>_snapshotYYYYMMDDHHmmss.json` instead of overwriting the current file |
+
+`sources.order` reports whether the order came from Timeline, DialogTree, or the numeric table suffix fallback. `sources.dialogTree` contains compact graph evidence; `branchRoutes` and `dialogTreeRoute` preserve authored option paths. `sources.runtimeJump` is raw Runtime Jump Track evidence and is intentionally not treated as a server-side mission progression order.
 
 ### extract Options
 

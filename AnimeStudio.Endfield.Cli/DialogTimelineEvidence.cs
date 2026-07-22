@@ -49,6 +49,8 @@ internal static class DialogTimelineEvidence
         public required long PathId { get; init; }
         public List<JsonObject> Lines { get; } = new();
         public List<JsonObject> Options { get; } = new();
+        public List<JsonObject> RuntimeJumpClips { get; } = new();
+        public int DuplicateClipCount { get; set; }
     }
 
     public static Dictionary<string, JsonArray> Recover(IEnumerable<DialogTimelineRecord> input)
@@ -75,6 +77,18 @@ internal static class DialogTimelineEvidence
                 .ToArray();
             foreach (string dialogId in dialogIds)
             {
+                var dialogLines = candidate.Lines
+                    .Where(line => string.Equals(
+                        DialogIdFromLineId(line["id"]?.GetValue<string>()),
+                        dialogId,
+                        StringComparison.OrdinalIgnoreCase))
+                    .ToArray();
+                var dialogOptions = candidate.Options
+                    .Where(option => string.Equals(
+                        DialogIdFromOptionId(option["id"]?.GetValue<string>()),
+                        dialogId,
+                        StringComparison.OrdinalIgnoreCase))
+                    .ToArray();
                 var payload = new JsonObject
                 {
                     ["timeline"] = candidate.Name,
@@ -83,8 +97,10 @@ internal static class DialogTimelineEvidence
                         ["sourceFile"] = candidate.SourceFile,
                         ["pathId"] = candidate.PathId,
                     },
-                    ["lines"] = new JsonArray(candidate.Lines.Select(item => item.DeepClone()).ToArray()),
-                    ["options"] = new JsonArray(candidate.Options.Select(item => item.DeepClone()).ToArray()),
+                    ["lines"] = new JsonArray(dialogLines.Select(item => item.DeepClone()).ToArray()),
+                    ["options"] = new JsonArray(dialogOptions.Select(item => item.DeepClone()).ToArray()),
+                    ["runtimeJumpClips"] = new JsonArray(candidate.RuntimeJumpClips.Select(item => item.DeepClone()).ToArray()),
+                    ["duplicateClipCount"] = candidate.DuplicateClipCount,
                 };
                 if (!result.TryGetValue(dialogId, out var timelines))
                 {
@@ -113,6 +129,7 @@ internal static class DialogTimelineEvidence
         var visited = new HashSet<string>(StringComparer.Ordinal);
         EnqueueReferences(root, "m_Tracks", 0, queue, records);
         EnqueueReferences(root, "m_Children", 0, queue, records);
+        EnqueueReferences(root, "m_PlayableAsset", 0, queue, records);
 
         while (queue.Count > 0)
         {
@@ -120,10 +137,43 @@ internal static class DialogTimelineEvidence
             if (!visited.Add(Key(track.SourceFile, track.PathId))) continue;
 
             var clips = GetArray(track.Payload, "m_Clips");
+            long? trackOptionIndex = Int64OrNull(track.Payload["OptionIndex"]);
             for (int clipIndex = 0; clipIndex < clips.Count; clipIndex++)
             {
                 if (clips[clipIndex] is not JsonObject clip) continue;
                 var asset = ResolveReference(track, clip["m_Asset"], records);
+                if (track.Name.StartsWith("Runtime Jump Track", StringComparison.OrdinalIgnoreCase))
+                {
+                    long? optionIndex = Int64OrNull(clip["optionIndex"]) ?? trackOptionIndex;
+                    JsonNode? start = NumberOrNull(clip["m_Start"]);
+                    JsonNode? duration = NumberOrNull(clip["m_Duration"]);
+                    double durationValue = duration?.GetValue<double>() ?? 0.0;
+                    if (optionIndex is not null && durationValue > 0.0)
+                    {
+                        var jump = new JsonObject
+                        {
+                            ["kind"] = "runtimeJump",
+                            ["optionIndex"] = optionIndex.Value,
+                            ["start"] = start,
+                            ["duration"] = duration,
+                            ["end"] = (start?.GetValue<double>() ?? 0.0) + durationValue,
+                            ["track"] = ObjectRef(track),
+                            ["clipOrder"] = clipIndex,
+                            ["displayName"] = StringValue(clip["m_DisplayName"]),
+                            ["asset"] = asset is null ? null : ObjectRef(asset),
+                        };
+                        foreach (string field in new[]
+                        {
+                            "isReverseJump", "needChangeOptionAfterJump", "optionIndexAfterJump", "isJumpFirst",
+                            "crossFadeDurationAfterJump",
+                        })
+                        {
+                            JsonNode? value = asset?.Payload[field];
+                            if (value is not null) jump[field] = value.DeepClone();
+                        }
+                        candidate.RuntimeJumpClips.Add(jump);
+                    }
+                }
                 string? lineId = FirstMatchingString(clip, ExplicitLineFields)
                     ?? FirstMatchingString(asset?.Payload, ExplicitLineFields)
                     ?? FirstMatchingString(clip, LineIdPattern)
@@ -157,6 +207,26 @@ internal static class DialogTimelineEvidence
                         ["asset"] = asset is null ? null : ObjectRef(asset),
                     });
                 }
+                if (asset is not null)
+                {
+                    foreach (DialogTimelineRecord optionAsset in ResolveReferences(asset, "bindingOptionAssets", records))
+                    {
+                        foreach (string boundOptionId in MatchingStrings(optionAsset.Payload, OptionIdPattern))
+                        {
+                            candidate.Options.Add(new JsonObject
+                            {
+                                ["id"] = boundOptionId,
+                                ["start"] = NumberOrNull(clip["m_Start"]),
+                                ["duration"] = NumberOrNull(clip["m_Duration"]),
+                                ["trackOrder"] = trackOrder,
+                                ["clipOrder"] = clipIndex,
+                                ["source"] = ObjectRef(track),
+                                ["asset"] = ObjectRef(optionAsset),
+                                ["anchorLineId"] = lineId,
+                            });
+                        }
+                    }
+                }
 
                 if (asset is not null)
                 {
@@ -170,6 +240,23 @@ internal static class DialogTimelineEvidence
         }
 
         candidate.Lines.Sort(CompareTimelineItems);
+        var selectedLines = new Dictionary<string, JsonObject>(StringComparer.OrdinalIgnoreCase);
+        foreach (JsonObject line in candidate.Lines)
+        {
+            string? id = StringValue(line["id"]);
+            if (string.IsNullOrWhiteSpace(id)) continue;
+            if (!selectedLines.TryGetValue(id, out var previous))
+            {
+                selectedLines[id] = line;
+                continue;
+            }
+
+            candidate.DuplicateClipCount++;
+            if (CompareLinePreference(line, previous) < 0)
+                selectedLines[id] = line;
+        }
+        candidate.Lines.Clear();
+        candidate.Lines.AddRange(selectedLines.Values.OrderBy(item => item, Comparer<JsonObject>.Create(CompareTimelineItems)));
         candidate.Options.Sort(CompareTimelineItems);
         return candidate;
     }
@@ -181,11 +268,41 @@ internal static class DialogTimelineEvidence
         Queue<(DialogTimelineRecord record, int trackOrder)> queue,
         IReadOnlyDictionary<string, DialogTimelineRecord> records)
     {
-        JsonArray references = GetArray(owner.Payload, property);
-        for (int index = 0; index < references.Count; index++)
+        int index = 0;
+        foreach (DialogTimelineRecord target in ResolveReferences(owner, property, records))
         {
-            var target = ResolveReference(owner, references[index], records);
-            if (target is not null) queue.Enqueue((target, order + index));
+            queue.Enqueue((target, order + index));
+            index++;
+        }
+    }
+
+    private static IEnumerable<DialogTimelineRecord> ResolveReferences(
+        DialogTimelineRecord owner,
+        string property,
+        IReadOnlyDictionary<string, DialogTimelineRecord> records)
+    {
+        foreach (JsonObject reference in ReferenceNodes(owner.Payload[property]))
+        {
+            DialogTimelineRecord? target = ResolveReference(owner, reference, records);
+            if (target is not null) yield return target;
+        }
+    }
+
+    private static IEnumerable<JsonObject> ReferenceNodes(JsonNode? node)
+    {
+        if (node is JsonObject obj)
+        {
+            if (obj["m_PathID"] is not null)
+                yield return obj;
+            foreach (var property in obj)
+                foreach (JsonObject nested in ReferenceNodes(property.Value))
+                    yield return nested;
+        }
+        else if (node is JsonArray array)
+        {
+            foreach (JsonNode? child in array)
+                foreach (JsonObject nested in ReferenceNodes(child))
+                    yield return nested;
         }
     }
 
@@ -226,6 +343,17 @@ internal static class DialogTimelineEvidence
         VisitStrings(node, value =>
         {
             if (found is null && pattern.IsMatch(value)) found = value;
+        });
+        return found;
+    }
+
+    private static IReadOnlyList<string> MatchingStrings(JsonNode? node, Regex pattern)
+    {
+        var found = new List<string>();
+        VisitStrings(node, value =>
+        {
+            if (pattern.IsMatch(value) && !found.Contains(value, StringComparer.OrdinalIgnoreCase))
+                found.Add(value);
         });
         return found;
     }
@@ -294,11 +422,51 @@ internal static class DialogTimelineEvidence
         return (left["clipOrder"]?.GetValue<int>() ?? 0).CompareTo(right["clipOrder"]?.GetValue<int>() ?? 0);
     }
 
+    private static int CompareLinePreference(JsonObject left, JsonObject right)
+    {
+        int compare = LineSourcePriority(left).CompareTo(LineSourcePriority(right));
+        if (compare != 0) return compare;
+        compare = LineDurationPriority(left).CompareTo(LineDurationPriority(right));
+        if (compare != 0) return compare;
+        return CompareTimelineItems(left, right);
+    }
+
+    private static int LineSourcePriority(JsonObject line)
+    {
+        string assetName = ObjectName(line["asset"]);
+        if (assetName.StartsWith("DialogTrunkPlayableAsset", StringComparison.OrdinalIgnoreCase)) return 0;
+        if (assetName.StartsWith("DialogLipSyncPlayableAsset", StringComparison.OrdinalIgnoreCase)) return 2;
+        return 1;
+    }
+
+    private static int LineDurationPriority(JsonObject line)
+    {
+        double duration = line["duration"] is JsonValue value && value.TryGetValue<double>(out var number)
+            ? number
+            : 0.0;
+        return duration > 0.0 && duration <= 0.05 ? 1 : 0;
+    }
+
+    private static string ObjectName(JsonNode? node)
+        => node is JsonObject obj ? StringValue(obj["name"]) ?? string.Empty : string.Empty;
+
     private static string? DialogIdFromLineId(string? lineId)
     {
         if (lineId is null) return null;
         var match = DialogIdPattern.Match(lineId);
         return match.Success ? lineId[..lineId.LastIndexOf('_')] : null;
+    }
+
+    private static string? DialogIdFromOptionId(string? optionId)
+    {
+        if (optionId is null) return null;
+        var match = OptionIdPattern.Match(optionId);
+        if (!match.Success) return null;
+        int optionSeparator = optionId.LastIndexOf('_');
+        if (optionSeparator <= "option_".Length) return null;
+        int groupSeparator = optionId.LastIndexOf('_', optionSeparator - 1);
+        if (groupSeparator <= "option_".Length) return null;
+        return optionId["option_".Length..groupSeparator];
     }
 
     private static string Key(string sourceFile, long pathId)

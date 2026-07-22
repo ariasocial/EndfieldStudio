@@ -15,6 +15,7 @@ internal static class DialogTimelineScanner
 {
     private const int MonoBehaviourClassId = 114;
     private const int PlayableDirectorClassId = 320;
+    private const int TextAssetClassId = 49;
 
     internal sealed class ScanResult
     {
@@ -24,6 +25,8 @@ internal static class DialogTimelineScanner
         public long RootsFound { get; set; }
         public long GraphObjectsRead { get; set; }
         public long DialogsWithEvidence => ByDialogId.Count;
+        public long DialogsWithDialogTreeEvidence => DialogTreesByDialogId.Count;
+        public Dictionary<string, JsonArray> DialogTreesByDialogId { get; } = new(StringComparer.OrdinalIgnoreCase);
     }
 
     public static ScanResult Scan(string vfsPath, string? baseVfsPath, string scratchPath)
@@ -119,6 +122,13 @@ internal static class DialogTimelineScanner
                 if (name.Contains("dlgtl_", StringComparison.OrdinalIgnoreCase))
                     rootInfos.Add(info);
             }
+            else if (info.classID == TextAssetClassId)
+            {
+                string name = ReadTextAssetName(serializedFile, info, game);
+                if (name.Contains("dlg_", StringComparison.OrdinalIgnoreCase)
+                    || name.Contains("DialogTree", StringComparison.OrdinalIgnoreCase))
+                    rootInfos.Add(info);
+            }
             else if (info.classID == PlayableDirectorClassId)
             {
                 // PlayableDirector normally points at a Timeline asset. Its
@@ -161,6 +171,17 @@ internal static class DialogTimelineScanner
             foreach (JsonNode? timeline in timelines)
                 existing.Add(timeline?.DeepClone());
         }
+
+        foreach (var (dialogId, trees) in DialogTreeEvidence.Recover(records.Values))
+        {
+            if (!result.DialogTreesByDialogId.TryGetValue(dialogId, out var existing))
+            {
+                result.DialogTreesByDialogId[dialogId] = trees;
+                continue;
+            }
+            foreach (JsonNode? tree in trees)
+                existing.Add(tree?.DeepClone());
+        }
     }
 
     private static string ReadMonoBehaviourName(AS.SerializedFile serializedFile, AS.ObjectInfo info, AS.Game game)
@@ -177,19 +198,48 @@ internal static class DialogTimelineScanner
         }
     }
 
+    private static string ReadTextAssetName(AS.SerializedFile serializedFile, AS.ObjectInfo info, AS.Game game)
+    {
+        try
+        {
+            var reader = new AS.ObjectReader(serializedFile.reader, serializedFile, info, game);
+            var asset = new AS.TextAsset(reader);
+            return asset.Name ?? string.Empty;
+        }
+        catch
+        {
+            return string.Empty;
+        }
+    }
+
     private static DialogTimelineRecord? ReadRecord(AS.SerializedFile serializedFile, AS.ObjectInfo info, AS.Game game)
     {
         try
         {
             var reader = new AS.ObjectReader(serializedFile.reader, serializedFile, info, game);
-            AS.Object asset = info.classID == MonoBehaviourClassId
-                ? new AS.MonoBehaviour(reader)
-                : new AS.Object(reader);
-            var type = asset.ToType();
-            if (type is null) return null;
-
-            JsonNode? payload = JsonNode.Parse(JsonConvert.SerializeObject(type));
-            if (payload is not JsonObject payloadObject) return null;
+            AS.Object asset;
+            JsonObject payloadObject;
+            if (info.classID == TextAssetClassId)
+            {
+                var textAsset = new AS.TextAsset(reader);
+                asset = textAsset;
+                payloadObject = new JsonObject
+                {
+                    ["m_Name"] = textAsset.Name,
+                    ["m_Script"] = Convert.ToBase64String(textAsset.m_Script ?? Array.Empty<byte>()),
+                };
+            }
+            else
+            {
+                asset = info.classID == MonoBehaviourClassId
+                    ? new AS.MonoBehaviour(reader)
+                    : new AS.Object(reader);
+                var type = asset.ToType();
+                if (type is null) return null;
+                JsonNode? payload = JsonNode.Parse(JsonConvert.SerializeObject(type));
+                if (payload is not JsonObject parsedPayload) return null;
+                payloadObject = parsedPayload;
+            }
             string name = asset.Name;
             if (string.IsNullOrWhiteSpace(name))
                 name = StringValue(payloadObject["m_Name"]) ?? string.Empty;
@@ -211,7 +261,11 @@ internal static class DialogTimelineScanner
     private static IEnumerable<long> FindGraphReferences(JsonNode payload)
     {
         if (payload is not JsonObject obj) yield break;
-        foreach (string property in new[] { "m_Tracks", "m_Children", "m_Clips", "m_Asset", "m_PlayableAsset" })
+        foreach (string property in new[]
+        {
+            "m_Tracks", "m_Children", "m_Clips", "m_Asset", "m_PlayableAsset",
+            "bindingOptionAssets",
+        })
         {
             foreach (JsonNode? node in EnumerateNodes(obj[property]))
             {

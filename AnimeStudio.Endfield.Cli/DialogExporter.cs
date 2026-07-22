@@ -69,6 +69,7 @@ internal static class DialogExporter
         var tableSet = LoadTables(options);
         var languages = ResolveLanguages(options.Language, tableSet);
         Dictionary<string, JsonArray> timelineEvidence = new(StringComparer.OrdinalIgnoreCase);
+        Dictionary<string, JsonArray> dialogTreeEvidence = new(StringComparer.OrdinalIgnoreCase);
         try
         {
             string scratchPath = Path.Combine(Path.GetTempPath(), "endfield-dialog-timeline");
@@ -77,9 +78,11 @@ internal static class DialogExporter
                 options.BaseVfsPath,
                 scratchPath);
             timelineEvidence = timelineScan.ByDialogId;
+            dialogTreeEvidence = timelineScan.DialogTreesByDialogId;
             Console.WriteLine(
                 $"  Timeline evidence: {timelineScan.DialogsWithEvidence:N0} dialogs, "
                 + $"{timelineScan.RootsFound:N0} roots, {timelineScan.GraphObjectsRead:N0} graph objects, "
+                + $"DialogTree={timelineScan.DialogsWithDialogTreeEvidence:N0} dialogs, "
                 + $"{timelineScan.BundlesFailed:N0} bundle failures");
             if (timelineScan.BundlesFailed > 0)
                 tableSet.Warnings.Add($"Timeline scan skipped {timelineScan.BundlesFailed:N0} Bundle file(s).");
@@ -104,7 +107,7 @@ internal static class DialogExporter
             int languageFilesWritten = 0;
             foreach (string language in languages)
             {
-                var dialogs = BuildDialogs(tableSet, language, timelineEvidence);
+                var dialogs = BuildDialogs(tableSet, language, timelineEvidence, dialogTreeEvidence);
                 if (!dialogs.TryGetValue(dialogId, out var payload))
                     continue;
                 WriteDialog(options.OutPath, dialogId, language, payload, snapshotTimestamp);
@@ -122,7 +125,7 @@ internal static class DialogExporter
         int written = 0;
         foreach (string language in languages)
         {
-            var dialogs = BuildDialogs(tableSet, language, timelineEvidence);
+            var dialogs = BuildDialogs(tableSet, language, timelineEvidence, dialogTreeEvidence);
             foreach (var (dialogId, payload) in dialogs.OrderBy(pair => pair.Key, StringComparer.Ordinal))
             {
                 WriteDialog(options.OutPath, dialogId, language, payload, allSnapshotTimestamp);
@@ -292,7 +295,8 @@ internal static class DialogExporter
     private static Dictionary<string, JsonObject> BuildDialogs(
         TableSet tableSet,
         string language,
-        IReadOnlyDictionary<string, JsonArray> timelineEvidence)
+        IReadOnlyDictionary<string, JsonArray> timelineEvidence,
+        IReadOnlyDictionary<string, JsonArray> dialogTreeEvidence)
     {
         var dialogs = new Dictionary<string, JsonObject>(StringComparer.Ordinal);
         var dialogRows = GetTable(tableSet, "DialogTextTable");
@@ -395,6 +399,7 @@ internal static class DialogExporter
                 SortArray(group["options"] as JsonArray, "order");
 
             ApplyTimelineEvidence(payload, timelineEvidence);
+            ApplyDialogTreeEvidence(payload, dialogTreeEvidence);
             var warnings = (JsonArray)payload["warnings"]!;
             foreach (string warning in tableSet.Warnings)
                 if (!warning.StartsWith("Table parse failed", StringComparison.Ordinal))
@@ -404,6 +409,81 @@ internal static class DialogExporter
         }
 
         return dialogs;
+    }
+
+    private static void ApplyDialogTreeEvidence(
+        JsonObject payload,
+        IReadOnlyDictionary<string, JsonArray> dialogTreeEvidence)
+    {
+        string dialogId = payload["dialogId"]?.GetValue<string>() ?? string.Empty;
+        if (!dialogTreeEvidence.TryGetValue(dialogId, out var trees) || trees.Count == 0)
+            return;
+
+        var sources = (JsonObject)payload["sources"]!;
+        var warnings = (JsonArray)payload["warnings"]!;
+        sources["dialogTree"] = trees.DeepClone();
+
+        var lineIds = ((JsonArray)payload["lines"]!)
+            .OfType<JsonObject>()
+            .Select(line => line["id"]?.GetValue<string>())
+            .Where(id => id is not null)
+            .Select(id => id!)
+            .ToArray();
+        var best = trees.OfType<JsonObject>()
+            .Select(tree =>
+            {
+                var entries = ((JsonArray)tree["lineIds"]!).OfType<JsonValue>()
+                    .Select(value => value.TryGetValue<string>(out var id) ? id : null)
+                    .Where(id => id is not null)
+                    .Select(id => id!)
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .Select((id, index) => (id, index))
+                    .ToDictionary(item => item.id, item => item.index, StringComparer.OrdinalIgnoreCase);
+                return (tree, entries, matched: lineIds.Count(entries.ContainsKey));
+            })
+            .OrderByDescending(item => item.matched)
+            .ThenByDescending(item => item.entries.Count)
+            .FirstOrDefault();
+        if (best.tree is null || best.matched == 0) return;
+
+        var branches = best.tree["branches"] as JsonArray ?? new JsonArray();
+        if (branches.Count > 0)
+        {
+            payload["branchRoutes"] = branches.DeepClone();
+            foreach (JsonObject group in ((JsonArray)payload["optionGroups"]!).OfType<JsonObject>())
+            foreach (JsonObject option in ((JsonArray)group["options"]!).OfType<JsonObject>())
+            {
+                string? optionId = option["id"]?.GetValue<string>();
+                if (optionId is null) continue;
+                JsonObject? route = branches.OfType<JsonObject>().FirstOrDefault(branch =>
+                    string.Equals(branch["optionId"]?.GetValue<string>(), optionId, StringComparison.OrdinalIgnoreCase));
+                if (route is not null) option["dialogTreeRoute"] = route.DeepClone();
+            }
+            warnings.Add("DialogTree branch routes were recovered; branch-specific progression is represented as routes, not one global line order.");
+        }
+
+        foreach (JsonObject line in ((JsonArray)payload["lines"]!).OfType<JsonObject>())
+        {
+            string? id = line["id"]?.GetValue<string>();
+            if (id is not null && best.entries.TryGetValue(id, out int order))
+                line["dialogTreeOrder"] = order;
+        }
+
+        if (best.matched == lineIds.Length && branches.Count == 0)
+        {
+            foreach (JsonObject line in ((JsonArray)payload["lines"]!).OfType<JsonObject>())
+            {
+                string? id = line["id"]?.GetValue<string>();
+                if (id is not null && best.entries.TryGetValue(id, out int order))
+                {
+                    line["tableOrder"] = line["order"]?.DeepClone();
+                    line["order"] = order;
+                }
+            }
+            SortArray((JsonArray)payload["lines"]!, "order");
+            ((JsonObject)sources["order"]!)["method"] = "DialogTree graph order";
+            ((JsonObject)sources["order"]!)["confidence"] = "recovered";
+        }
     }
 
     private static void ApplyTimelineEvidence(
@@ -422,6 +502,14 @@ internal static class DialogExporter
         }
 
         sources["timeline"] = timelines.DeepClone();
+        var runtimeJumpClips = timelines.OfType<JsonObject>()
+            .SelectMany(timeline => (timeline["runtimeJumpClips"] as JsonArray ?? new JsonArray()).OfType<JsonObject>())
+            .ToArray();
+        if (runtimeJumpClips.Length > 0)
+        {
+            sources["runtimeJump"] = new JsonArray(runtimeJumpClips.Select(item => item.DeepClone()).ToArray());
+            warnings.Add("Runtime Jump Track evidence was recovered; option routing is retained as raw evidence and is not promoted to a single global order.");
+        }
         var timelineOptions = timelines.OfType<JsonObject>()
             .SelectMany(timeline => ((JsonArray)timeline["options"]!).OfType<JsonObject>())
             .Where(option => option["id"]?.GetValue<string>() is not null)
@@ -564,9 +652,12 @@ internal static class DialogExporter
         if (raw is null) return null;
         if (raw is JsonValue value && value.TryGetValue<string>(out var direct)) return direct;
 
-        string? id = raw is JsonObject obj
-            ? StringOrNull(obj, "id") ?? StringOrNull(obj, "key")
-            : null;
+        string? id = raw switch
+        {
+            JsonObject obj => StringOrNull(obj, "id") ?? StringOrNull(obj, "key"),
+            JsonValue value => ScalarString(value),
+            _ => null,
+        };
         if (string.IsNullOrWhiteSpace(id)) return null;
         if (!i18nRows.TryGetValue(id, out var row) || row is null) return null;
 
@@ -584,9 +675,20 @@ internal static class DialogExporter
     private static string? StringOrNull(JsonObject row, string property)
     {
         if (!row.TryGetPropertyValue(property, out var value) || value is null) return null;
-        return value is JsonValue jsonValue && jsonValue.TryGetValue<string>(out var text)
-            ? text
-            : null;
+        if (value is not JsonValue jsonValue) return null;
+        return ScalarString(jsonValue);
+    }
+
+    private static string? ScalarString(JsonValue jsonValue)
+    {
+        if (jsonValue.TryGetValue<string>(out var text)) return text;
+        if (jsonValue.TryGetValue<long>(out var integer))
+            return integer.ToString(CultureInfo.InvariantCulture);
+        if (jsonValue.TryGetValue<ulong>(out var unsignedInteger))
+            return unsignedInteger.ToString(CultureInfo.InvariantCulture);
+        if (jsonValue.TryGetValue<decimal>(out var decimalValue))
+            return decimalValue.ToString(CultureInfo.InvariantCulture);
+        return null;
     }
 
     private static int ParseInt(string value)
