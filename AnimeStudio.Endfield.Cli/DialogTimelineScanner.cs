@@ -238,8 +238,8 @@ internal static class DialogTimelineScanner
         }
         else if (node is JsonObject obj)
         {
-            foreach (JsonNode? child in obj.Values)
-                foreach (JsonNode? nested in EnumerateNodes(child))
+            foreach (var property in obj)
+                foreach (JsonNode? nested in EnumerateNodes(property.Value))
                     yield return nested;
         }
     }
