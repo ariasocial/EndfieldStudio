@@ -27,6 +27,12 @@ Built on top of [Escartem/AnimeStudio](https://github.com/Escartem/AnimeStudio),
 
 - **SparkBuffer → JSON**: Decode binary Table blocks (E1 pipeline), byte-identical to fluffy-dumper output
 
+### Dialog export
+
+- **Dialog JSON**: Export `DialogTextTable` scenes with localized text, speaker data, summaries, options, mission-name lookup, and source evidence
+- **Timeline evidence**: Recover line order from serialized Unity Timeline track/clip data when IDs match `DialogTextTable`; retain confidence and source warnings
+- **Hot-update merge**: Read Persistent first and merge StreamingAssets as the base VFS
+
 ### Lua
 
 - **XXTEA + base64**: Auto-decrypt Lua scripts in Lua block
@@ -338,6 +344,7 @@ endfield-dump inspect --vfs ./StreamingAssets --limit 50
 | --------- | -------------------------------------------------------------------------------- |
 | `list`    | List all BlockTypes with chunk/file counts                                       |
 | `dump`    | Stage 1 decrypt to disk (Lua auto post-processed, Table→JSON, USM→raw, rest raw) |
+| `dialog`  | Export localized DialogTextTable scenes as one JSON file per dialog         |
 | `inspect` | Parse bundle internal object type distribution (for research)                    |
 | `extract` | Stage 1 + 2 + 3 full pipeline, regex-export images                               |
 | `audio`   | Extract Wwise audio (WEM / WAV / MP3) with AudioDialog path mapping              |
@@ -425,4 +432,3 @@ End-to-end image extract: \~70× faster than upstream (524s vs \~10 hours estima
 - **AnimationClip export**: parsing works, but Endfield uses ACL-compressed buffers (`0xac11ac11` magic) for actual keyframe data. AnimeStudio only reads the raw bytes; full ACL decompression is not implemented. Exported metadata-only JSON is not useful without keyframes.
 - **Mesh export**: not implemented.
 - **Windows builds**: supported (Texture2DDecoder.Windows + Ooz.dll are included). Audio/video pipelines need Windows builds of vgmstream-cli and ffmpeg. macOS untested.
-

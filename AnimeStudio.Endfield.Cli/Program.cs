@@ -31,6 +31,8 @@ internal static class Program
                                 [--format png|bmp|tga] [--png-compression none|fast|default]
                                 [--max-memory-gb N] [--no-chunk-batching]
                                 [--exclude-material] [--classify]
+          endfield-dump dialog  --vfs <vfs_path> --out <dir> [--base-vfs <base_vfs_path>]
+                                [--language <code>] [--dialog <id>] [--snapshot]
           endfield-dump audio   --vfs <streaming_assets_path> --out <dir>
                                 [--language all|chinese|english|japanese|korean]
                                 [--format wem|wav|mp3] [--block all|audio|initialaudio|auditaudio|voice]
@@ -74,6 +76,7 @@ internal static class Program
                 "list" => RunList(args.AsSpan(1)),
                 "inspect" => RunInspect(args.AsSpan(1)),
                 "extract" => await RunExtract(args[1..]),
+                "dialog" => DialogExporter.Run(args.AsSpan(1)),
                 "audio" => RunAudio(args.AsSpan(1)),
                 "video" => RunVideo(args.AsSpan(1)),
                 "inspect-bundle" => RunInspectBundle(args.AsSpan(1)),
