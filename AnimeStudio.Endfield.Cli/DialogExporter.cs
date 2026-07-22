@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
+using System.Text.Encodings.Web;
 using AnimeStudio.Endfield;
 using AnimeStudio.Endfield.Processors;
 
@@ -713,6 +714,10 @@ internal static class DialogExporter
         string directory = Path.Combine(outPath, dialogId);
         Directory.CreateDirectory(directory);
         string target = Path.Combine(directory, fileName);
-        File.WriteAllText(target, payload.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
+        File.WriteAllText(target, payload.ToJsonString(new JsonSerializerOptions
+        {
+            WriteIndented = true,
+            Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+        }));
     }
 }
