@@ -842,6 +842,7 @@ internal static class StoryExporter
             ? BuildMissionFlow(runtimeAsset, missionId, scenes.Keys, runtimeReferences)
             : null;
         JsonObject order = BuildSceneOrder(sceneArray, flow, runtimeReferences, runtimeEvidence);
+        sceneArray = ReorderScenesBySceneOrder(sceneArray, order["sceneOrder"] as JsonArray);
         JsonObject timelineRecovery = BuildTimelineRecovery(sceneArray, flow, runtimeReferences, runtimeEvidence);
         var warnings = new JsonArray();
         if (flow is null)
@@ -1285,11 +1286,47 @@ internal static class StoryExporter
         {
             ["method"] = "source-backed partial order",
             ["confidence"] = edges.Count > 0 ? "partial-order" : "fallback",
-            ["note"] = "sceneOrder is a deterministic topological presentation of authored edges; disconnected scenes and same-layer siblings are not claimed to be chronological.",
+            ["note"] = "sceneOrder is a deterministic topological presentation of authored edges and is also used for the top-level scenes array; disconnected scenes and same-layer siblings are not claimed to be chronological.",
             ["sceneOrder"] = new JsonArray(topologicalOrder.Select(value => JsonValue.Create(value)).ToArray()),
             ["edges"] = edges,
             ["evidence"] = runtimeReferenceEvidence,
         };
+    }
+
+    private static JsonArray ReorderScenesBySceneOrder(JsonArray scenes, JsonArray? sceneOrder)
+    {
+        if (sceneOrder is null || sceneOrder.Count == 0)
+            return scenes;
+
+        var byId = scenes.OfType<JsonObject>()
+            .Where(scene => scene["id"] is not null)
+            .ToDictionary(
+                scene => scene["id"]!.GetValue<string>(),
+                scene => scene,
+                StringComparer.OrdinalIgnoreCase);
+        var emitted = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var ordered = new List<JsonNode?>();
+
+        foreach (string? sceneId in sceneOrder.Select(value => value?.GetValue<string>()))
+        {
+            if (sceneId is null || !byId.TryGetValue(sceneId, out JsonObject? scene))
+                continue;
+            if (!emitted.Add(sceneId))
+                continue;
+            ordered.Add(scene.DeepClone());
+        }
+
+        // Keep the exporter lossless if a future ordering implementation omits
+        // a scene. The omitted scenes retain their previous deterministic order.
+        foreach (JsonObject scene in scenes.OfType<JsonObject>())
+        {
+            string? sceneId = scene["id"]?.GetValue<string>();
+            if (sceneId is null || !emitted.Add(sceneId))
+                continue;
+            ordered.Add(scene.DeepClone());
+        }
+
+        return new JsonArray(ordered.ToArray());
     }
 
     private static string EdgeStrength(string kind)
