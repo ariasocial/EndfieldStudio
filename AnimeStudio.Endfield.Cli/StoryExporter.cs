@@ -825,7 +825,11 @@ internal static class StoryExporter
         var sceneArray = new JsonArray();
         foreach (JsonObject scene in scenes.Values.OrderBy(SceneSortKey))
         {
-            SortArray(scene["lines"] as JsonArray, "order");
+            // Timeline/DialogTree attachment has already established an
+            // authored line order. Numeric table order is only a fallback and
+            // must not overwrite source-backed ordering here.
+            if (!HasAuthoredLineOrder(scene))
+                SortArray(scene["lines"] as JsonArray, "order");
             SortArray(scene["summary"] as JsonArray, "order");
             SortArray(scene["optionGroups"] as JsonArray, "order");
             foreach (JsonObject group in (scene["optionGroups"] as JsonArray ?? new JsonArray()).OfType<JsonObject>())
@@ -1875,6 +1879,13 @@ internal static class StoryExporter
 
     private static string SceneSortKey(JsonObject scene)
         => $"{scene["kind"]?.GetValue<string>()}\u001f{scene["scene"]?.GetValue<string>()}\u001f{scene["id"]?.GetValue<string>()}";
+
+    private static bool HasAuthoredLineOrder(JsonObject scene)
+        => scene["order"] is JsonObject order
+            && string.Equals(
+                order["confidence"]?.GetValue<string>(),
+                "authored",
+                StringComparison.OrdinalIgnoreCase);
 
     private static Dictionary<string, JsonNode?> GetTable(TableSet tableSet, string name)
         => tableSet.Tables.TryGetValue(name, out var table)
