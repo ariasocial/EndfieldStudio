@@ -378,15 +378,46 @@ endfield-dump story --vfs ./Persistent --base-vfs ./StreamingAssets \
     --out ./story --mission e11m7 --language JP --no-timeline
 ```
 
-The output is `<out>/<mission>/<language>.json`. Each document contains
-`scenes`, `flow`, `order`, and source evidence. `flow` preserves
-`MissionRuntimeAsset.questDic[*].prevQuestIdList` as a DAG/partial order;
-`order` combines that with ordered `LevelScriptData` references. A same-layer
-quest is intentionally not presented as a falsely precise chronological order.
-When Timeline scanning is enabled, dialog Timeline/DialogTree evidence and
-cutscene subtitle clip order are attached to each scene. `--no-timeline` is a
-fast table/runtime-only mode for iteration; it does not remove authored table
-text or quest-flow data.
+The output is `<out>/<mission>/<language>.json`. Each document contains the
+fully localized `scenes` collection plus `flow`, `order`, `timelineRecovery`,
+and source evidence. The scene collection covers dialog, radio, cutscene,
+black-screen, remote communication, and SNS text when those records are
+present in the extracted tables.
+
+`flow` preserves `MissionRuntimeAsset.questDic[*].prevQuestIdList` as a
+mission DAG/partial order. `questSequence` edges represent multiple story
+references found in one quest; `questFailGuard` edges represent references
+inside that quest's failed-condition branch. It also includes client-side
+actions such as `PlayRadio`, and connects `NpcProxyExDataTable` dialog records
+to quests whose tracking data names the corresponding NPC proxy. This
+provides the authored quest-to-conversation relationships without claiming
+that server-side unlock conditions are a complete chronological log.
+
+`timelineRecovery` is the most detailed order evidence. Its
+`sourceBackedSceneEdges` are annotated with `strength`:
+
+- `strong`: UID-linked `LevelScriptData` `nextId` chains, quest predecessor/
+  sequence/guard edges, and authored DialogTree branch edges;
+- `weak`: consecutive LevelScript file/offset order, which is useful evidence
+  but is not by itself a guaranteed play order;
+- `unknown`: an edge whose source does not have a recognized ordering rule.
+
+`sourceBackedSceneSequences` preserves the original scene sequences and the
+file/record offsets used to derive them. `components` shows which scenes are
+actually connected by evidence. `unresolvedScenes` and
+`unresolvedSceneDetails` deliberately retain scenes for which the extracted
+files do not prove a cross-scene edge. For example, a scene can have a valid
+runtime reference but still be a singleton in the available LevelScript data;
+the exporter leaves its position unresolved instead of inventing a false
+chronological link.
+
+`order.sceneOrder` is a deterministic topological presentation of the
+source-backed edges. It is convenient for reading, but disconnected scenes and
+same-layer siblings are not claimed to be chronological. When Timeline
+scanning is enabled, dialog Timeline/DialogTree evidence and cutscene subtitle
+clip order are attached to each scene. `--no-timeline` is a faster
+table/runtime-only mode for iteration; it does not remove authored table text,
+mission flow, or LevelScript order evidence.
 
 ### extract Options
 

@@ -9,9 +9,11 @@ using AnimeStudio.Endfield.Processors;
 namespace AnimeStudio.Endfield.Cli;
 
 /// <summary>
-/// Builds a unified, table-backed story document. This is intentionally
-/// separate from <see cref="DialogExporter"/> so the existing dialog output
-/// remains backward compatible while story-specific scene types are added.
+/// Builds a unified story document from localized tables, mission runtime
+/// data, LevelScriptData, and optional Unity Timeline evidence. This is
+/// intentionally separate from <see cref="DialogExporter"/> so the existing
+/// dialog output remains backward compatible while story-specific scene types
+/// and source-backed order evidence are added.
 /// </summary>
 internal static class StoryExporter
 {
@@ -40,6 +42,18 @@ internal static class StoryExporter
         "cutscene_", "black_", "sns_", "remotecomm_", "radio_",
     };
 
+    private static readonly Regex RuntimeStoryPattern = new(
+        @"(?<![A-Za-z0-9_])(?:f_|m_|fm_)?(?:dlg|cutscene|cs_video|black|remotecomm|radio|sns)_[A-Za-z0-9_]+",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+    private static readonly Regex DialogLineScenePattern = new(
+        @"^(?<scene>dlg_.+_\d+(?:d\d+)?)_\d+$",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+    private static readonly Regex DialogOptionScenePattern = new(
+        @"^option_(?<scene>dlg_.+_\d+(?:d\d+)?)_\d+_\d+$",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
     private sealed class Options
     {
         public string? VfsPath;
@@ -58,11 +72,50 @@ internal static class StoryExporter
         public Dictionary<string, JsonObject> Tables { get; } = new(StringComparer.Ordinal);
         public Dictionary<string, List<string>> Sources { get; } = new(StringComparer.Ordinal);
         public Dictionary<string, JsonObject> MissionRuntimeAssets { get; } = new(StringComparer.OrdinalIgnoreCase);
-        public List<StoryReference> RuntimeStoryReferences { get; } = new();
+        public RuntimeStoryEvidence RuntimeStoryEvidence { get; } = new();
         public List<string> Warnings { get; } = new();
     }
 
-    private sealed record StoryReference(string Value, string Source, int Offset, string EvidenceKind);
+    private sealed record StoryReference(
+        string Value,
+        string Source,
+        int Offset,
+        string EvidenceKind,
+        string FileStem,
+        string SourceGroup,
+        string? ContextKey);
+
+    private sealed record StoryRuntimeEdge(
+        string From,
+        string To,
+        string Kind,
+        string Source,
+        int FromOffset,
+        int ToOffset,
+        string EvidenceKind);
+
+    private sealed record StoryAuthoredEdge(
+        string From,
+        string To,
+        string Kind,
+        string Source,
+        JsonObject Evidence);
+
+    private sealed class RuntimeStoryEvidence
+    {
+        public List<StoryReference> References { get; } = new();
+        public List<StoryRuntimeEdge> Edges { get; } = new();
+        public List<JsonObject> Sequences { get; } = new();
+    }
+
+    private sealed record MissionQuest(
+        string Id,
+        int FlowIndex,
+        List<string> Prev,
+        List<string> Refs,
+        List<string> FailRefs,
+        List<JsonObject> Actions,
+        JsonObject Raw);
 
     public static int Run(ReadOnlySpan<string> args)
     {
@@ -211,6 +264,9 @@ internal static class StoryExporter
         catch (DirectoryNotFoundException) { return; }
         catch (FileNotFoundException) { return; }
 
+        var filesWithReferences = new List<(string Path, string Stem, string Group, string EvidenceKind, List<StoryReference> References)>();
+        var npcProxyContext = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
         foreach (ChunkInfo chunk in info.Chunks)
         foreach (AnimeStudio.Endfield.FileInfo file in chunk.Files)
         {
@@ -219,28 +275,54 @@ internal static class StoryExporter
                 ? "LevelScriptData"
                 : normalizedPath.Contains("LevelData", StringComparison.OrdinalIgnoreCase)
                     ? "LevelData"
-                : normalizedPath.Contains("NpcProxyExDataTable", StringComparison.OrdinalIgnoreCase)
-                    ? "NpcProxyExDataTable"
-                    : "";
+                    : normalizedPath.Contains("NpcProxyExDataTable", StringComparison.OrdinalIgnoreCase)
+                        ? "NpcProxyExDataTable"
+                        : "";
             if (evidenceKind.Length == 0) continue;
             try
             {
-                string text = System.Text.Encoding.UTF8.GetString(loader.ExtractFileToBytes(BlockType.JsonData, chunk, file));
-                foreach (Match match in Regex.Matches(
-                             text,
-                             @"(?<![A-Za-z0-9_])(?:f_|m_|fm_)?(?:dlg|cutscene|black|remotecomm|radio|sns)_[A-Za-z0-9_]+",
-                             RegexOptions.IgnoreCase | RegexOptions.CultureInvariant))
+                byte[] data = loader.ExtractFileToBytes(BlockType.JsonData, chunk, file);
+                string text = System.Text.Encoding.UTF8.GetString(data);
+                if (evidenceKind.Equals("NpcProxyExDataTable", StringComparison.OrdinalIgnoreCase))
+                {
+                    try
+                    {
+                        JsonNode? parsed = JsonNode.Parse(text);
+                        foreach (var pair in ExtractNpcProxyDialogContexts(parsed))
+                            npcProxyContext[pair.Key] = pair.Value;
+                    }
+                    catch (JsonException)
+                    {
+                        // The regex evidence below remains useful even when an
+                        // optional structured parse is unavailable.
+                    }
+                }
+                int slash = normalizedPath.LastIndexOf('/');
+                string group = normalizedPath[..Math.Max(0, slash)];
+                string stem = Path.GetFileNameWithoutExtension(normalizedPath);
+                var fileReferences = new List<StoryReference>();
+                foreach (Match match in RuntimeStoryPattern.Matches(text))
                 {
                     string value = NormalizeRuntimeReference(match.Value);
                     if (value.Length == 0) continue;
                     if (!string.IsNullOrWhiteSpace(missionFilter)
                         && !IsMissionReference(value, missionFilter.Trim())) continue;
-                    result.RuntimeStoryReferences.Add(new StoryReference(
+                    var reference = new StoryReference(
                         value,
                         $"{sourceName}:{normalizedPath}",
                         match.Index,
-                        evidenceKind));
+                        evidenceKind,
+                        stem,
+                        $"{sourceName}:{group}",
+                        npcProxyContext.GetValueOrDefault(value));
+                    result.RuntimeStoryEvidence.References.Add(reference);
+                    fileReferences.Add(reference);
                 }
+                if (fileReferences.Count > 0)
+                    filesWithReferences.Add((normalizedPath, stem, $"{sourceName}:{group}", evidenceKind, fileReferences));
+                if (evidenceKind.Equals("LevelScriptData", StringComparison.OrdinalIgnoreCase)
+                    && (string.IsNullOrWhiteSpace(missionFilter) || fileReferences.Count > 0))
+                    AddLevelScriptChainEvidence(result.RuntimeStoryEvidence, normalizedPath, data, missionFilter);
             }
             catch (FileNotFoundException)
             {
@@ -253,6 +335,130 @@ internal static class StoryExporter
                 if (result.Warnings.Count < 20)
                     result.Warnings.Add($"Runtime story scan failed ({sourceName}/{file.FileName}): {ex.Message}");
             }
+        }
+
+        foreach (var file in filesWithReferences)
+            AddRuntimeSequence(result.RuntimeStoryEvidence, file.EvidenceKind, file.Path, file.Group, file.References, "file-offset-order");
+
+        foreach (var group in filesWithReferences
+                     .Where(file => file.EvidenceKind.Equals("LevelScriptData", StringComparison.OrdinalIgnoreCase))
+                     .GroupBy(file => file.Group, StringComparer.OrdinalIgnoreCase))
+        {
+            var numbered = group
+                // LevelScriptData ids are often larger than Int32 (for example
+                // 37000020006). Keep the authored numeric ordering intact.
+                .Select(file => (File: file, Number: long.TryParse(file.Stem, out long value) ? value : -1L))
+                .Where(item => item.Number >= 0)
+                .OrderBy(item => item.Number)
+                .ToArray();
+            for (int index = 1; index < numbered.Length; index++)
+            {
+                var previous = numbered[index - 1];
+                var current = numbered[index];
+                if (current.Number - previous.Number != 1) continue;
+
+                StoryReference from = previous.File.References[^1];
+                StoryReference to = current.File.References[0];
+                if (from.Value.Equals(to.Value, StringComparison.OrdinalIgnoreCase)) continue;
+
+                result.RuntimeStoryEvidence.Edges.Add(new StoryRuntimeEdge(
+                    from.Value,
+                    to.Value,
+                    "levelscriptCrossFileOrder",
+                    $"{from.Source};{to.Source}",
+                    from.Offset,
+                    to.Offset,
+                    "LevelScriptData"));
+                result.RuntimeStoryEvidence.Sequences.Add(new JsonObject
+                {
+                    ["kind"] = "levelscriptCrossFileOrder",
+                    ["sourceFiles"] = new JsonArray(from.Source, to.Source),
+                    ["sceneKeys"] = new JsonArray(from.Value, to.Value),
+                    ["fileStems"] = new JsonArray(previous.Number, current.Number),
+                    ["evidence"] = "consecutive numeric LevelScriptData files",
+                });
+            }
+        }
+    }
+
+    private static void AddRuntimeSequence(
+        RuntimeStoryEvidence evidence,
+        string evidenceKind,
+        string sourceFile,
+        string sourceGroup,
+        IReadOnlyList<StoryReference> references,
+        string ordering)
+    {
+        var unique = new List<StoryReference>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (StoryReference reference in references.OrderBy(value => value.Offset))
+        {
+            if (seen.Add(reference.Value)) unique.Add(reference);
+        }
+        if (unique.Count < 2) return;
+
+        string edgeKind = evidenceKind.Equals("LevelScriptData", StringComparison.OrdinalIgnoreCase)
+            ? "levelscriptFileOrder"
+            : $"{evidenceKind}ReferenceOrder";
+        for (int index = 1; index < unique.Count; index++)
+        {
+            StoryReference from = unique[index - 1];
+            StoryReference to = unique[index];
+            evidence.Edges.Add(new StoryRuntimeEdge(
+                from.Value,
+                to.Value,
+                edgeKind,
+                sourceFile,
+                from.Offset,
+                to.Offset,
+                evidenceKind));
+        }
+
+        evidence.Sequences.Add(new JsonObject
+        {
+            ["kind"] = edgeKind,
+            ["sourceFile"] = sourceFile,
+            ["sourceGroup"] = sourceGroup,
+            ["sceneKeys"] = new JsonArray(unique.Select(value => JsonValue.Create(value.Value)).ToArray()),
+            ["offsets"] = new JsonArray(unique.Select(value => JsonValue.Create(value.Offset)).ToArray()),
+            ["evidence"] = ordering,
+        });
+    }
+
+    private static void AddLevelScriptChainEvidence(
+        RuntimeStoryEvidence evidence,
+        string sourceFile,
+        byte[] data,
+        string? missionFilter)
+    {
+        foreach (LevelScriptEvidence.Chain chain in LevelScriptEvidence.Decode(data))
+        {
+            List<int> offsets;
+            List<string> sceneKeys = LevelScriptEvidence.SceneKeys(chain, missionFilter?.Trim(), out offsets);
+            if (sceneKeys.Count == 0) continue;
+
+            for (int index = 1; index < sceneKeys.Count; index++)
+            {
+                evidence.Edges.Add(new StoryRuntimeEdge(
+                    sceneKeys[index - 1],
+                    sceneKeys[index],
+                    "levelscriptSceneChain",
+                    sourceFile,
+                    offsets[index - 1],
+                    offsets[index],
+                    "LevelScriptData UID nextId chain"));
+            }
+
+            evidence.Sequences.Add(new JsonObject
+            {
+                ["kind"] = "levelscriptSceneChain",
+                ["sourceFile"] = sourceFile,
+                ["sceneKeys"] = new JsonArray(sceneKeys.Select(value => JsonValue.Create(value)).ToArray()),
+                ["offsets"] = new JsonArray(offsets.Select(value => JsonValue.Create(value)).ToArray()),
+                ["recordLocalIds"] = new JsonArray(chain.Records.Select(value => JsonValue.Create(value.LocalId)).ToArray()),
+                ["recordNextIds"] = new JsonArray(chain.Records.Select(value => JsonValue.Create(value.NextId)).ToArray()),
+                ["evidence"] = "UID-linked LevelScriptData records",
+            });
         }
     }
 
@@ -591,20 +797,29 @@ internal static class StoryExporter
         AttachCutsceneTimelineEvidence(scenes, textRows, cutsceneTimelineEvidence);
         AttachDialogEvidence(scenes, dialogTimelineEvidence, dialogTreeEvidence);
 
-        var runtimeReferences = tableSet.RuntimeStoryReferences
+        RuntimeStoryEvidence runtimeEvidence = tableSet.RuntimeStoryEvidence;
+        var runtimeReferences = runtimeEvidence.References
             .Where(reference => IsMissionReference(reference.Value, missionId))
             .OrderBy(reference => reference.Source, StringComparer.OrdinalIgnoreCase)
             .ThenBy(reference => reference.Offset)
             .ToList();
         foreach (StoryReference reference in runtimeReferences)
         {
-            string? sceneId = ResolveRuntimeSceneId(reference.Value, scenes.Keys);
-            if (sceneId is null || !SceneMatches(sceneId, sceneFilter)) continue;
-            if (!scenes.ContainsKey(sceneId))
+            string sceneId = reference.Value;
+            if (!SceneMatches(sceneId, sceneFilter)) continue;
+            JsonObject scene = GetOrCreateScene(scenes, sceneId, SceneKind(sceneId), missionId, SceneSuffix(sceneId));
+            var runtimeSources = scene["runtimeSources"] as JsonArray;
+            if (runtimeSources is null)
+                scene["runtimeSources"] = runtimeSources = new JsonArray();
+            runtimeSources.Add(new JsonObject
             {
-                string kind = SceneKind(sceneId);
-                GetOrCreateScene(scenes, sceneId, kind, missionId, SceneSuffix(sceneId));
-            }
+                ["kind"] = reference.EvidenceKind,
+                ["source"] = reference.Source,
+                ["offset"] = reference.Offset,
+                ["fileStem"] = reference.FileStem,
+            });
+            if (reference.ContextKey is not null)
+                ((JsonObject)runtimeSources[^1]!) ["contextKey"] = reference.ContextKey;
         }
 
         var sceneArray = new JsonArray();
@@ -620,9 +835,10 @@ internal static class StoryExporter
 
         string? missionName = ResolveText(textRows.GetValueOrDefault($"{missionId}_name"), i18nRows);
         JsonObject? flow = tableSet.MissionRuntimeAssets.TryGetValue(missionId, out var runtimeAsset)
-            ? BuildMissionFlow(runtimeAsset, missionId, scenes.Keys)
+            ? BuildMissionFlow(runtimeAsset, missionId, scenes.Keys, runtimeReferences)
             : null;
-        JsonObject order = BuildSceneOrder(sceneArray, flow, runtimeReferences);
+        JsonObject order = BuildSceneOrder(sceneArray, flow, runtimeReferences, runtimeEvidence);
+        JsonObject timelineRecovery = BuildTimelineRecovery(sceneArray, flow, runtimeReferences, runtimeEvidence);
         var warnings = new JsonArray();
         if (flow is null)
             warnings.Add("MissionRuntimeAsset was not found; cross-scene order uses fallback sorting.");
@@ -630,7 +846,8 @@ internal static class StoryExporter
             warnings.Add("MissionRuntimeAsset was found, but it did not connect any exported scenes.");
         if (runtimeReferences.Count == 0)
             warnings.Add("No LevelScriptData/NpcProxyExDataTable story-reference evidence was found for this mission.");
-        warnings.Add("Cutscene subtitle Timeline evidence is not attached yet.");
+        if (runtimeEvidence.Edges.Count == 0)
+            warnings.Add("No source-backed cross-scene runtime edges were found for this mission.");
         return new JsonObject
         {
             ["schemaVersion"] = 1,
@@ -641,6 +858,7 @@ internal static class StoryExporter
             ["scenes"] = sceneArray,
             ["flow"] = flow,
             ["order"] = order,
+            ["timelineRecovery"] = timelineRecovery,
             ["sources"] = new JsonObject
             {
                 ["tables"] = new JsonArray(tableSet.Sources.Keys.OrderBy(value => value, StringComparer.Ordinal)
@@ -650,9 +868,66 @@ internal static class StoryExporter
         };
     }
 
-    private static JsonObject BuildMissionFlow(JsonObject raw, string missionId, IEnumerable<string> exportedSceneIds)
+    private static List<JsonObject> ExtractClientActions(JsonObject raw, string questId)
     {
-        var quests = new List<(string Id, int FlowIndex, List<string> Prev, List<string> Refs, JsonObject Raw)>();
+        var result = new List<JsonObject>();
+        if (raw["clientActionMapKey"] is not JsonArray keys
+            || raw["clientActionMapValue"] is not JsonArray values
+            || raw["actionMapRaw"]?["dataMap"]?["actionList"] is not JsonArray actionList)
+            return result;
+
+        var actionsById = actionList.OfType<JsonObject>()
+            .Select(action => (Id: ParseInt(ScalarString(action["_ID"]) ?? "-1"), Action: action))
+            .Where(item => item.Id >= 0)
+            .GroupBy(item => item.Id)
+            .ToDictionary(group => group.Key, group => group.First().Action);
+
+        for (int index = 0; index < Math.Min(keys.Count, values.Count); index++)
+        {
+            if (keys[index] is not JsonObject key
+                || !string.Equals(ScalarString(key["questId"]), questId, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            int actionId = ParseInt(ScalarString(values[index]) ?? "-1");
+            if (!actionsById.TryGetValue(actionId, out JsonObject? action)) continue;
+
+            var references = ExtractStoryRefs(action)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            string? type = ScalarString(action["$type"]);
+            if (!string.IsNullOrWhiteSpace(type))
+            {
+                int comma = type.IndexOf(',', StringComparison.Ordinal);
+                if (comma >= 0) type = type[..comma];
+                type = type.Trim()
+                    .Split('.', StringSplitOptions.RemoveEmptyEntries)
+                    .LastOrDefault();
+            }
+
+            result.Add(new JsonObject
+            {
+                ["questId"] = questId,
+                ["actionSlot"] = ParseInt(ScalarString(key["action"]) ?? "-1"),
+                ["actionId"] = actionId,
+                ["actionType"] = type,
+                ["source"] = "MissionRuntimeAsset.clientActionMapKey[*]",
+                ["valueSource"] = "MissionRuntimeAsset.clientActionMapValue[*]",
+                ["actionSource"] = "MissionRuntimeAsset.actionMapRaw.dataMap.actionList[*]",
+                ["storyReferences"] = new JsonArray(references.Select(value => JsonValue.Create(value)).ToArray()),
+                ["raw"] = action.DeepClone(),
+            });
+        }
+
+        return result;
+    }
+
+    private static JsonObject BuildMissionFlow(
+        JsonObject raw,
+        string missionId,
+        IEnumerable<string> exportedSceneIds,
+        IReadOnlyList<StoryReference> runtimeReferences)
+    {
+        var quests = new List<MissionQuest>();
         if (raw["questDic"] is JsonObject questDic)
         {
             foreach (var pair in questDic)
@@ -660,7 +935,13 @@ internal static class StoryExporter
                 if (pair.Value is not JsonObject quest) continue;
                 string id = ScalarString(quest["questId"]) ?? pair.Key;
                 if (string.IsNullOrWhiteSpace(id)) continue;
-                var refs = ExtractStoryRefs(quest)
+                // A failed condition is an alternate route, not part of the
+                // normal quest scene sequence. Keep it in a separate field so
+                // it can become a guarded edge below without polluting the
+                // main conversation order.
+                var normalQuest = (JsonObject)quest.DeepClone();
+                normalQuest.Remove("failedCondition");
+                var refs = ExtractStoryRefs(normalQuest)
                     .Where(reference => reference.StartsWith("dlg_", StringComparison.OrdinalIgnoreCase)
                         || reference.StartsWith("cutscene_", StringComparison.OrdinalIgnoreCase)
                         || reference.StartsWith("black_", StringComparison.OrdinalIgnoreCase)
@@ -669,10 +950,45 @@ internal static class StoryExporter
                         || reference.StartsWith("sns_", StringComparison.OrdinalIgnoreCase))
                     .Distinct(StringComparer.OrdinalIgnoreCase)
                     .ToList();
+                var failRefs = ExtractStoryRefs(quest["failedCondition"])
+                    .Where(reference => reference.StartsWith("dlg_", StringComparison.OrdinalIgnoreCase)
+                        || reference.StartsWith("cutscene_", StringComparison.OrdinalIgnoreCase)
+                        || reference.StartsWith("black_", StringComparison.OrdinalIgnoreCase)
+                        || reference.StartsWith("remotecomm_", StringComparison.OrdinalIgnoreCase)
+                        || reference.StartsWith("radio_", StringComparison.OrdinalIgnoreCase)
+                        || reference.StartsWith("sns_", StringComparison.OrdinalIgnoreCase))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+                var clientActions = ExtractClientActions(raw, id);
+                foreach (string reference in clientActions
+                             .SelectMany(action => (action["storyReferences"] as JsonArray ?? new JsonArray())
+                                 .Select(value => value?.GetValue<string>()))
+                             .Where(reference => reference is not null)
+                             .Cast<string>())
+                    if (!refs.Contains(reference, StringComparer.OrdinalIgnoreCase)) refs.Add(reference);
                 var prev = ReadStringArray(quest["prevQuestIdList"]);
                 int flowIndex = ParseInt(ScalarString(quest["flowIndex"]) ?? "0");
-                quests.Add((id, flowIndex, prev, refs, quest));
+                quests.Add(new MissionQuest(id, flowIndex, prev, refs, failRefs, clientActions, quest));
             }
+        }
+
+        // NpcProxyExDataTable binds a dialog to the NPC used by a quest's
+        // tracking info. Preserve that authored relation so a client action
+        // in the predecessor quest can be connected to the NPC dialog that
+        // follows it, instead of leaving both scenes as unrelated nodes.
+        foreach (StoryReference reference in runtimeReferences.Where(value => value.ContextKey is not null))
+        foreach (int index in Enumerable.Range(0, quests.Count))
+        {
+            MissionQuest quest = quests[index];
+            bool tracksProxy = CollectTrackingHints(quest.Raw)
+                .OfType<JsonObject>()
+                .Any(hint => string.Equals(
+                    hint["npcProxyId"]?.GetValue<string>(),
+                    reference.ContextKey,
+                    StringComparison.OrdinalIgnoreCase));
+            if (!tracksProxy || quest.Refs.Contains(reference.Value, StringComparer.OrdinalIgnoreCase)) continue;
+            quest.Refs.Add(reference.Value);
+            quests[index] = quest;
         }
 
         var questIds = quests.Select(quest => quest.Id).ToHashSet(StringComparer.OrdinalIgnoreCase);
@@ -693,6 +1009,11 @@ internal static class StoryExporter
                 return 0;
             }
             var quest = quests.FirstOrDefault(value => value.Id.Equals(id, StringComparison.OrdinalIgnoreCase));
+            if (quest is null)
+            {
+                visiting.Remove(id);
+                return 0;
+            }
             stack.Add(id);
             var previousDepths = quest.Prev.Where(questIds.Contains).Select(prev => Depth(prev, stack)).ToList();
             stack.RemoveAt(stack.Count - 1);
@@ -708,7 +1029,31 @@ internal static class StoryExporter
         var sceneQuestRefs = new Dictionary<string, JsonArray>(StringComparer.OrdinalIgnoreCase);
         var groups = new JsonArray();
         var edges = new Dictionary<string, JsonObject>(StringComparer.OrdinalIgnoreCase);
-        foreach (var quest in quests.OrderBy(value => depth.GetValueOrDefault(value.Id)).ThenBy(value => value.FlowIndex).ThenBy(value => value.Id, StringComparer.OrdinalIgnoreCase))
+        void AddQuestEdge(string from, string to, string kind, IEnumerable<string> questIds)
+        {
+            if (from.Equals(to, StringComparison.OrdinalIgnoreCase)
+                || !exported.Contains(from) || !exported.Contains(to)) return;
+            string edgeKey = $"{from}\u001f{to}\u001f{kind}";
+            if (!edges.TryGetValue(edgeKey, out JsonObject? edge))
+            {
+                edge = new JsonObject
+                {
+                    ["from"] = from,
+                    ["to"] = to,
+                    ["kind"] = kind,
+                    ["strength"] = EdgeStrength(kind),
+                    ["questIds"] = new JsonArray(),
+                    ["source"] = "MissionRuntimeAsset.questDic[*]",
+                };
+                edges[edgeKey] = edge;
+            }
+            var edgeQuestIds = (JsonArray)edge["questIds"]!;
+            foreach (string questId in questIds)
+                if (!edgeQuestIds.Any(value => value?.GetValue<string>()?.Equals(questId, StringComparison.OrdinalIgnoreCase) == true))
+                    edgeQuestIds.Add(questId);
+        }
+
+        foreach (MissionQuest quest in quests.OrderBy(value => depth.GetValueOrDefault(value.Id)).ThenBy(value => value.FlowIndex).ThenBy(value => value.Id, StringComparer.OrdinalIgnoreCase))
         {
             var refs = quest.Refs.Where(exported.Contains).ToList();
             int layer = depth.GetValueOrDefault(quest.Id);
@@ -750,35 +1095,31 @@ internal static class StoryExporter
             if (tracking.Count > 0) group["tracking"] = tracking;
             if (quest.Refs.Count > 0)
                 group["storyReferences"] = new JsonArray(quest.Refs.Select(value => JsonValue.Create(value)).ToArray());
+            if (quest.FailRefs.Count > 0)
+                group["failStoryReferences"] = new JsonArray(quest.FailRefs.Select(value => JsonValue.Create(value)).ToArray());
+            if (quest.Actions.Count > 0)
+                group["clientActions"] = new JsonArray(quest.Actions.Select(action => action.DeepClone()).ToArray());
             groups.Add(group);
-            if (refs.Count == 0) continue;
+
+            for (int index = 1; index < refs.Count; index++)
+                AddQuestEdge(refs[index - 1], refs[index], "questSequence", new[] { quest.Id });
+
+            if (refs.Count > 0)
             foreach (string previousId in quest.Prev)
             {
                 var previous = quests.FirstOrDefault(value => value.Id.Equals(previousId, StringComparison.OrdinalIgnoreCase));
-                if (previous.Id is null) continue;
+                if (previous is null) continue;
                 var previousRefs = previous.Refs.Where(exported.Contains).ToList();
                 if (previousRefs.Count == 0) continue;
                 string from = previousRefs[^1];
                 string to = refs[0];
-                if (from.Equals(to, StringComparison.OrdinalIgnoreCase)) continue;
-                string edgeKey = $"{from}\u001f{to}";
-                if (!edges.TryGetValue(edgeKey, out var edge))
-                {
-                    edge = new JsonObject
-                    {
-                        ["from"] = from,
-                        ["to"] = to,
-                        ["kind"] = "questPrev",
-                        ["questIds"] = new JsonArray(),
-                        ["source"] = "MissionRuntimeAsset.questDic[*].prevQuestIdList",
-                    };
-                    edges[edgeKey] = edge;
-                }
-                var edgeQuestIds = (JsonArray)edge["questIds"]!;
-                foreach (string edgeQuestId in new[] { previous.Id, quest.Id })
-                    if (!edgeQuestIds.Any(value => value?.GetValue<string>()?.Equals(edgeQuestId, StringComparison.OrdinalIgnoreCase) == true))
-                        edgeQuestIds.Add(edgeQuestId);
+                AddQuestEdge(from, to, "questPrev", new[] { previous.Id, quest.Id });
             }
+
+            string? guardSource = refs.LastOrDefault();
+            if (guardSource is not null)
+                foreach (string failRef in quest.FailRefs.Where(exported.Contains))
+                    AddQuestEdge(guardSource, failRef, "questFailGuard", new[] { quest.Id });
         }
 
         return new JsonObject
@@ -793,11 +1134,15 @@ internal static class StoryExporter
         };
     }
 
-    private static JsonObject BuildSceneOrder(JsonArray scenes, JsonObject? flow, List<StoryReference> runtimeReferences)
+    private static JsonObject BuildSceneOrder(
+        JsonArray scenes,
+        JsonObject? flow,
+        List<StoryReference> runtimeReferences,
+        RuntimeStoryEvidence runtimeEvidence)
     {
         var sceneIds = scenes.OfType<JsonObject>().Select(scene => scene["id"]?.GetValue<string>() ?? "").ToHashSet(StringComparer.OrdinalIgnoreCase);
         var runtimeOrder = new List<string>();
-        var runtimeEvidence = new JsonArray();
+        var runtimeReferenceEvidence = new JsonArray();
         string levelId = flow?["levelId"]?.GetValue<string>() ?? "";
         foreach (StoryReference reference in runtimeReferences
                      .OrderBy(reference => RuntimeSourcePriority(reference, levelId))
@@ -807,7 +1152,7 @@ internal static class StoryExporter
             string? sceneId = ResolveRuntimeSceneId(reference.Value, sceneIds);
             if (sceneId is null) continue;
             if (!runtimeOrder.Contains(sceneId, StringComparer.OrdinalIgnoreCase)) runtimeOrder.Add(sceneId);
-            runtimeEvidence.Add(new JsonObject
+            runtimeReferenceEvidence.Add(new JsonObject
             {
                 ["sceneId"] = sceneId,
                 ["reference"] = reference.Value,
@@ -824,7 +1169,7 @@ internal static class StoryExporter
                 ["confidence"] = "fallback",
                 ["edges"] = new JsonArray(),
                 ["sceneOrder"] = new JsonArray(scenes.OfType<JsonObject>().Select(scene => JsonValue.Create(scene["id"]?.GetValue<string>())).ToArray()),
-                ["evidence"] = runtimeEvidence,
+                ["evidence"] = runtimeReferenceEvidence,
             };
         }
         var orderMap = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
@@ -847,33 +1192,329 @@ internal static class StoryExporter
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToArray();
         var edges = new JsonArray();
-        for (int index = 1; index < runtimeOrder.Count; index++)
+        var edgeKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (StoryRuntimeEdge edge in runtimeEvidence.Edges)
         {
-            string from = runtimeOrder[index - 1];
-            string to = runtimeOrder[index];
-            if (from.Equals(to, StringComparison.OrdinalIgnoreCase)) continue;
+            if (!sceneIds.Contains(edge.From) || !sceneIds.Contains(edge.To)) continue;
+            if (!edgeKeys.Add($"{edge.From}\u001f{edge.To}\u001f{edge.Kind}")) continue;
             edges.Add(new JsonObject
             {
-                ["from"] = from,
-                ["to"] = to,
-                ["kind"] = "runtimeReferenceOrder",
-                ["source"] = "LevelScriptData/NpcProxyExDataTable",
+                ["from"] = edge.From,
+                ["to"] = edge.To,
+                ["kind"] = edge.Kind,
+                ["strength"] = EdgeStrength(edge.Kind),
+                ["source"] = edge.Source,
+                ["fromOffset"] = edge.FromOffset,
+                ["toOffset"] = edge.ToOffset,
+                ["evidenceKind"] = edge.EvidenceKind,
             });
         }
+        foreach (StoryAuthoredEdge edge in EnumerateDialogTreeEdges(scenes, sceneIds))
+        {
+            if (!edgeKeys.Add($"{edge.From}\u001f{edge.To}\u001f{edge.Kind}")) continue;
+            var item = new JsonObject
+            {
+                ["from"] = edge.From,
+                ["to"] = edge.To,
+                ["kind"] = edge.Kind,
+                ["strength"] = EdgeStrength(edge.Kind),
+                ["source"] = edge.Source,
+                ["evidenceKind"] = "DialogTree authored branch",
+            };
+            foreach (var property in edge.Evidence)
+                item[property.Key] = property.Value?.DeepClone();
+            edges.Add(item);
+        }
         if (flow?["edges"] is JsonArray flowEdges)
-            foreach (JsonNode? edge in flowEdges)
-                edges.Add(edge?.DeepClone());
+            foreach (JsonObject edge in flowEdges.OfType<JsonObject>())
+            {
+                string? from = edge["from"]?.GetValue<string>();
+                string? to = edge["to"]?.GetValue<string>();
+                string kind = edge["kind"]?.GetValue<string>() ?? "missionFlow";
+                if (from is null || to is null
+                    || !edgeKeys.Add($"{from}\u001f{to}\u001f{kind}")) continue;
+                JsonObject copy = (JsonObject)edge.DeepClone();
+                copy["strength"] ??= EdgeStrength(kind);
+                edges.Add(copy);
+            }
+
+        var sourceRank = runtimeOrder
+            .Select((value, index) => (value, index))
+            .ToDictionary(item => item.value, item => item.index, StringComparer.OrdinalIgnoreCase);
+        var successors = sceneIds.ToDictionary(value => value, _ => new HashSet<string>(StringComparer.OrdinalIgnoreCase), StringComparer.OrdinalIgnoreCase);
+        var indegree = sceneIds.ToDictionary(value => value, _ => 0, StringComparer.OrdinalIgnoreCase);
+        foreach (JsonObject edge in edges.OfType<JsonObject>())
+        {
+            string? from = edge["from"]?.GetValue<string>();
+            string? to = edge["to"]?.GetValue<string>();
+            if (from is null || to is null || !sceneIds.Contains(from) || !sceneIds.Contains(to)
+                || !successors[from].Add(to)) continue;
+            indegree[to]++;
+        }
+        int Rank(string sceneId)
+            => orderMap.GetValueOrDefault(sceneId, int.MaxValue / 2);
+        var ready = new SortedSet<string>(Comparer<string>.Create((left, right) =>
+        {
+            if (left.Equals(right, StringComparison.OrdinalIgnoreCase)) return 0;
+            int comparison = Rank(left).CompareTo(Rank(right));
+            if (comparison != 0) return comparison;
+            comparison = sourceRank.GetValueOrDefault(left, int.MaxValue).CompareTo(sourceRank.GetValueOrDefault(right, int.MaxValue));
+            return comparison != 0 ? comparison : StringComparer.OrdinalIgnoreCase.Compare(left, right);
+        }));
+        foreach (string sceneId in sceneIds)
+            if (indegree[sceneId] == 0) ready.Add(sceneId);
+        var topologicalOrder = new List<string>();
+        while (ready.Count > 0)
+        {
+            string current = ready.Min!;
+            ready.Remove(current);
+            topologicalOrder.Add(current);
+            foreach (string next in successors[current])
+                if (--indegree[next] == 0) ready.Add(next);
+        }
+        if (topologicalOrder.Count < sceneIds.Count)
+            topologicalOrder.AddRange(sceneIds
+                .Where(sceneId => !topologicalOrder.Contains(sceneId, StringComparer.OrdinalIgnoreCase))
+                .OrderBy(Rank)
+                .ThenBy(sceneId => sceneId, StringComparer.OrdinalIgnoreCase));
         return new JsonObject
         {
-            ["method"] = runtimeOrder.Count > 0
-                ? "LevelScriptData reference order + questDagPartialOrder"
-                : orderMap.Count == 0 ? "scene key fallback" : "questDagPartialOrder",
-            ["confidence"] = runtimeOrder.Count > 0 ? "evidence" : orderMap.Count == sceneIds.Count ? "partial-order" : "mixed",
-            ["note"] = "Quest predecessor edges establish layers; siblings in the same layer are not claimed to be chronological.",
-            ["sceneOrder"] = new JsonArray(order.Select(value => JsonValue.Create(value)).ToArray()),
+            ["method"] = "source-backed partial order",
+            ["confidence"] = edges.Count > 0 ? "partial-order" : "fallback",
+            ["note"] = "sceneOrder is a deterministic topological presentation of authored edges; disconnected scenes and same-layer siblings are not claimed to be chronological.",
+            ["sceneOrder"] = new JsonArray(topologicalOrder.Select(value => JsonValue.Create(value)).ToArray()),
             ["edges"] = edges,
-            ["evidence"] = runtimeEvidence,
+            ["evidence"] = runtimeReferenceEvidence,
         };
+    }
+
+    private static string EdgeStrength(string kind)
+        => kind switch
+        {
+            "levelscriptSceneChain" or "questPrev" or "questSequence"
+                or "questFailGuard" or "authoredDirect" or "authoredMenu" => "strong",
+            "levelscriptFileOrder" or "levelscriptCrossFileOrder" => "weak",
+            _ => "unknown",
+        };
+
+    private static JsonObject BuildTimelineRecovery(
+        JsonArray scenes,
+        JsonObject? flow,
+        List<StoryReference> runtimeReferences,
+        RuntimeStoryEvidence runtimeEvidence)
+    {
+        var sceneIds = scenes.OfType<JsonObject>()
+            .Select(scene => scene["id"]?.GetValue<string>() ?? "")
+            .Where(value => value.Length > 0)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var edges = new Dictionary<string, JsonObject>(StringComparer.OrdinalIgnoreCase);
+
+        void AddEdge(string from, string to, string kind, string? source, JsonObject? evidence = null)
+        {
+            if (!sceneIds.Contains(from) || !sceneIds.Contains(to)
+                || from.Equals(to, StringComparison.OrdinalIgnoreCase)) return;
+            string key = $"{from}\u001f{to}";
+            if (!edges.TryGetValue(key, out JsonObject? edge))
+            {
+                edge = new JsonObject
+                {
+                    ["from"] = from,
+                    ["to"] = to,
+                    ["kind"] = kind,
+                    ["strength"] = EdgeStrength(kind),
+                    ["evidence"] = new JsonArray(),
+                };
+                edges[key] = edge;
+            }
+            else if (string.Equals(edge["kind"]?.GetValue<string>(), "questPrev", StringComparison.Ordinal))
+            {
+                edge["kind"] = kind;
+                edge["strength"] = EdgeStrength(kind);
+            }
+            if (source is not null)
+            {
+                var item = new JsonObject
+                {
+                    ["kind"] = kind,
+                    ["source"] = source,
+                };
+                if (evidence is not null)
+                    foreach (var property in evidence)
+                        item[property.Key] = property.Value?.DeepClone();
+                ((JsonArray)edge["evidence"]!).Add(item);
+            }
+        }
+
+        foreach (StoryRuntimeEdge edge in runtimeEvidence.Edges)
+        {
+            if (!sceneIds.Contains(edge.From) || !sceneIds.Contains(edge.To)) continue;
+            AddEdge(edge.From, edge.To, edge.Kind, edge.Source, new JsonObject
+            {
+                ["fromOffset"] = edge.FromOffset,
+                ["toOffset"] = edge.ToOffset,
+                ["evidenceKind"] = edge.EvidenceKind,
+            });
+        }
+        foreach (StoryAuthoredEdge edge in EnumerateDialogTreeEdges(scenes, sceneIds))
+            AddEdge(edge.From, edge.To, edge.Kind, edge.Source, edge.Evidence);
+        if (flow?["edges"] is JsonArray flowEdges)
+        foreach (JsonObject edge in flowEdges.OfType<JsonObject>())
+        {
+            string? from = edge["from"]?.GetValue<string>();
+            string? to = edge["to"]?.GetValue<string>();
+            if (from is null || to is null) continue;
+            AddEdge(from, to, edge["kind"]?.GetValue<string>() ?? "missionFlow", "MissionRuntimeAsset", edge);
+        }
+
+        var sequences = new JsonArray();
+        foreach (JsonObject sequence in runtimeEvidence.Sequences)
+        {
+            if (sequence["sceneKeys"] is not JsonArray sceneKeys) continue;
+            var relevant = new JsonArray();
+            foreach (string? sceneKey in sceneKeys.Select(value => value?.GetValue<string>()))
+                if (sceneKey is not null && sceneIds.Contains(sceneKey)) relevant.Add(sceneKey);
+            if (relevant.Count == 0) continue;
+            JsonObject copy = (JsonObject)sequence.DeepClone();
+            copy["missionSceneKeys"] = relevant;
+            sequences.Add(copy);
+        }
+
+        var connected = sceneIds.ToDictionary(value => value, _ => new HashSet<string>(StringComparer.OrdinalIgnoreCase), StringComparer.OrdinalIgnoreCase);
+        foreach (JsonObject edge in edges.Values)
+        {
+            string from = edge["from"]!.GetValue<string>();
+            string to = edge["to"]!.GetValue<string>();
+            connected[from].Add(to);
+            connected[to].Add(from);
+        }
+        var components = new JsonArray();
+        var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (string start in sceneIds.OrderBy(value => value, StringComparer.OrdinalIgnoreCase))
+        {
+            if (!visited.Add(start)) continue;
+            var component = new JsonArray();
+            var queue = new Queue<string>();
+            queue.Enqueue(start);
+            while (queue.Count > 0)
+            {
+                string current = queue.Dequeue();
+                component.Add(current);
+                foreach (string next in connected[current].OrderBy(value => value, StringComparer.OrdinalIgnoreCase))
+                    if (visited.Add(next)) queue.Enqueue(next);
+            }
+            components.Add(component);
+        }
+
+        var placed = edges.Values
+            .SelectMany(edge => new[] { edge["from"]?.GetValue<string>(), edge["to"]?.GetValue<string>() })
+            .Where(value => value is not null)
+            .Cast<string>()
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var unresolved = new JsonArray(sceneIds
+            .Where(sceneId => !placed.Contains(sceneId))
+            .OrderBy(sceneId => sceneId, StringComparer.OrdinalIgnoreCase)
+            .Select(sceneId => JsonValue.Create(sceneId))
+            .ToArray());
+        var unresolvedDetails = new JsonArray();
+        foreach (string sceneId in sceneIds
+                     .Where(value => !placed.Contains(value))
+                     .OrderBy(value => value, StringComparer.OrdinalIgnoreCase))
+        {
+            var references = runtimeReferences
+                .Where(reference => ResolveRuntimeSceneId(reference.Value, sceneIds)
+                    ?.Equals(sceneId, StringComparison.OrdinalIgnoreCase) == true)
+                .ToArray();
+            unresolvedDetails.Add(new JsonObject
+            {
+                ["sceneId"] = sceneId,
+                ["hasSourceReference"] = references.Length > 0,
+                ["sourceReferenceCount"] = references.Length,
+                ["reason"] = references.Length > 0
+                    ? "A source reference exists, but no source-backed cross-scene edge was recovered."
+                    : "The localized scene has no runtime or mission-flow reference in the scanned sources.",
+            });
+        }
+
+        var sourceReferences = new JsonArray();
+        foreach (StoryReference reference in runtimeReferences
+                     .Where(value => sceneIds.Contains(value.Value))
+                     .OrderBy(value => value.Source, StringComparer.OrdinalIgnoreCase)
+                     .ThenBy(value => value.Offset))
+        {
+            var item = new JsonObject
+            {
+                ["sceneId"] = reference.Value,
+                ["kind"] = reference.EvidenceKind,
+                ["source"] = reference.Source,
+                ["offset"] = reference.Offset,
+                ["fileStem"] = reference.FileStem,
+            };
+            if (reference.ContextKey is not null) item["contextKey"] = reference.ContextKey;
+            sourceReferences.Add(item);
+        }
+
+        return new JsonObject
+        {
+            ["policy"] = "Only source-backed runtime and mission edges are promoted; disconnected scenes remain explicitly unresolved.",
+            ["references"] = runtimeReferences.Count,
+            ["sourceBackedReferences"] = sourceReferences,
+            ["sourceBackedSceneEdges"] = new JsonArray(edges.Values.Select(edge => edge.DeepClone()).ToArray()),
+            ["sourceBackedSceneSequences"] = sequences,
+            ["components"] = components,
+            ["unresolvedScenes"] = unresolved,
+            ["unresolvedSceneDetails"] = unresolvedDetails,
+        };
+    }
+
+    private static IEnumerable<StoryAuthoredEdge> EnumerateDialogTreeEdges(
+        JsonArray scenes,
+        IReadOnlySet<string> sceneIds)
+    {
+        foreach (JsonObject scene in scenes.OfType<JsonObject>())
+        {
+            string? source = scene["id"]?.GetValue<string>();
+            if (source is null || !sceneIds.Contains(source)
+                || scene["dialogTree"] is not JsonArray trees) continue;
+
+            foreach (JsonObject tree in trees.OfType<JsonObject>())
+            foreach (JsonObject branch in (tree["branches"] as JsonArray ?? new JsonArray()).OfType<JsonObject>())
+            {
+                var targets = new List<string>();
+                string? optionId = branch["optionId"]?.GetValue<string>();
+                Match optionMatch = optionId is null
+                    ? Match.Empty
+                    : DialogOptionScenePattern.Match(optionId);
+                if (optionMatch.Success) targets.Add(optionMatch.Groups["scene"].Value);
+
+                if (branch["pathLineIds"] is JsonArray pathLineIds)
+                foreach (string? lineId in pathLineIds.Select(value => value?.GetValue<string>()))
+                {
+                    if (lineId is null) continue;
+                    Match lineMatch = DialogLineScenePattern.Match(lineId);
+                    if (lineMatch.Success) targets.Add(lineMatch.Groups["scene"].Value);
+                }
+
+                foreach (string target in targets.Distinct(StringComparer.OrdinalIgnoreCase))
+                {
+                    if (!sceneIds.Contains(target)
+                        || source.Equals(target, StringComparison.OrdinalIgnoreCase)) continue;
+                    var evidence = new JsonObject
+                    {
+                        ["treeName"] = tree["treeName"]?.DeepClone(),
+                        ["optionId"] = optionId,
+                        ["sourceNodeId"] = branch["sourceNodeId"]?.DeepClone(),
+                        ["afterLineId"] = branch["afterLineId"]?.DeepClone(),
+                        ["pathLineIds"] = branch["pathLineIds"]?.DeepClone() ?? new JsonArray(),
+                    };
+                    yield return new StoryAuthoredEdge(
+                        source,
+                        target,
+                        "authoredDirect",
+                        "DialogTreeEvidence",
+                        evidence);
+                }
+            }
+        }
     }
 
     private static bool IsMissionReference(string value, string missionId)
@@ -913,7 +1554,7 @@ internal static class StoryExporter
         if (node is null) yield break;
         if (node is JsonValue value && value.TryGetValue<string>(out string? text))
         {
-            foreach (Match match in Regex.Matches(text, @"(?<![A-Za-z0-9_])(?:f_|m_|fm_)?(?:dlg|cutscene|black|remotecomm|radio|sns)_[A-Za-z0-9_]+", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant))
+            foreach (Match match in Regex.Matches(text, @"(?<![A-Za-z0-9_])(?:f_|m_|fm_)?(?:dlg|cutscene|cs_video|black|remotecomm|radio|sns)_[A-Za-z0-9_]+", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant))
                 yield return NormalizeStoryRef(match.Value);
             yield break;
         }
@@ -923,6 +1564,21 @@ internal static class StoryExporter
         if (node is JsonArray array)
             foreach (JsonNode? child in array)
                 foreach (string reference in ExtractStoryRefs(child)) yield return reference;
+    }
+
+    private static IEnumerable<KeyValuePair<string, string>> ExtractNpcProxyDialogContexts(JsonNode? root)
+    {
+        if (root is not JsonObject rootObject) yield break;
+        JsonObject container = rootObject["data"] as JsonObject ?? rootObject;
+        foreach (var proxy in container)
+        {
+            foreach (JsonObject entry in Objects(proxy.Value))
+            {
+                string? dialogId = ScalarString(entry["dialogId"]);
+                if (!string.IsNullOrWhiteSpace(dialogId))
+                    yield return new KeyValuePair<string, string>(NormalizeStoryRef(dialogId), proxy.Key);
+            }
+        }
     }
 
     private static JsonArray CollectTrackingHints(JsonNode node)
