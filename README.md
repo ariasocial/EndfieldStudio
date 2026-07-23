@@ -348,6 +348,7 @@ endfield-dump inspect --vfs ./StreamingAssets --limit 50
 | `list`    | List all BlockTypes with chunk/file counts                                       |
 | `dump`    | Stage 1 decrypt to disk (Lua auto post-processed, Table→JSON, USM→raw, rest raw) |
 | `dialog`  | Export localized DialogTextTable scenes as one JSON file per dialog, with Timeline/DialogTree evidence |
+| `story`   | Export a unified mission story document containing dialog, radio, cutscene/black text, quest flow, and order evidence |
 | `inspect` | Parse bundle internal object type distribution (for research)                    |
 | `extract` | Stage 1 + 2 + 3 full pipeline, regex-export images                               |
 | `audio`   | Extract Wwise audio (WEM / WAV / MP3) with AudioDialog path mapping              |
@@ -360,11 +361,32 @@ endfield-dump inspect --vfs ./StreamingAssets --limit 50
 | `--vfs <path>`         | required | Persistent VFS directory; use `--base-vfs` for StreamingAssets fallback |
 | `--base-vfs <path>`    | none     | Base VFS used to resolve files shared with the hot-update |
 | `--out <dir>`          | required | Output root; writes `<out>/<dialogId>/<language>.json` |
-| `--language <code>`    | CN       | Language code such as `JP`, `CN`, `EN`, or `all` |
+| `--language <code>`    | JP       | Language code such as `JP`, `CN`, `EN`, or `all` |
 | `--dialog <id>`        | all      | Export only one dialog, for example `dlg_e7m3_3` |
 | `--snapshot`           | false    | Write `<language>_snapshotYYYYMMDDHHmmss.json` instead of overwriting the current file |
 
 `sources.order` reports whether the order came from Timeline, DialogTree, or the numeric table suffix fallback. `sources.dialogTree` contains compact graph evidence; `branchRoutes` and `dialogTreeRoute` preserve authored option paths. `sources.runtimeJump` is raw Runtime Jump Track evidence and is intentionally not treated as a server-side mission progression order.
+
+### story
+
+```bash
+# Full story export for every mission, Japanese by default
+endfield-dump story --vfs ./Persistent --base-vfs ./StreamingAssets --out ./story
+
+# One mission, without the expensive Unity Bundle Timeline scan
+endfield-dump story --vfs ./Persistent --base-vfs ./StreamingAssets \
+    --out ./story --mission e11m7 --language JP --no-timeline
+```
+
+The output is `<out>/<mission>/<language>.json`. Each document contains
+`scenes`, `flow`, `order`, and source evidence. `flow` preserves
+`MissionRuntimeAsset.questDic[*].prevQuestIdList` as a DAG/partial order;
+`order` combines that with ordered `LevelScriptData` references. A same-layer
+quest is intentionally not presented as a falsely precise chronological order.
+When Timeline scanning is enabled, dialog Timeline/DialogTree evidence and
+cutscene subtitle clip order are attached to each scene. `--no-timeline` is a
+fast table/runtime-only mode for iteration; it does not remove authored table
+text or quest-flow data.
 
 ### extract Options
 

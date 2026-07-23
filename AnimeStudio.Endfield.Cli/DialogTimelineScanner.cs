@@ -27,6 +27,8 @@ internal static class DialogTimelineScanner
         public long DialogsWithEvidence => ByDialogId.Count;
         public long DialogsWithDialogTreeEvidence => DialogTreesByDialogId.Count;
         public Dictionary<string, JsonArray> DialogTreesByDialogId { get; } = new(StringComparer.OrdinalIgnoreCase);
+        public Dictionary<string, JsonArray> CutscenesBySceneId { get; } = new(StringComparer.OrdinalIgnoreCase);
+        public long ScenesWithCutsceneEvidence => CutscenesBySceneId.Count;
     }
 
     public static ScanResult Scan(string vfsPath, string? baseVfsPath, string scratchPath)
@@ -181,6 +183,17 @@ internal static class DialogTimelineScanner
             }
             foreach (JsonNode? tree in trees)
                 existing.Add(tree?.DeepClone());
+        }
+
+        foreach (var (sceneId, lines) in CutsceneTimelineEvidence.Recover(records.Values))
+        {
+            if (!result.CutscenesBySceneId.TryGetValue(sceneId, out var existing))
+            {
+                result.CutscenesBySceneId[sceneId] = lines;
+                continue;
+            }
+            foreach (JsonNode? line in lines)
+                existing.Add(line?.DeepClone());
         }
     }
 

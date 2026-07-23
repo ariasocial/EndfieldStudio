@@ -42,7 +42,7 @@ internal static class DialogExporter
         public string? VfsPath;
         public string? BaseVfsPath;
         public string? OutPath;
-        public string Language = "CN";
+        public string Language = "JP";
         public string? DialogId;
         public bool Snapshot;
         public bool Help;
@@ -180,7 +180,7 @@ internal static class DialogExporter
         Console.WriteLine();
         Console.WriteLine("Options:");
         Console.WriteLine("  --base-vfs <path>    Base VFS used for hot-update fallback");
-        Console.WriteLine("  --language <code|all> Localization code (default: CN; all=every available language)");
+        Console.WriteLine("  --language <code|all> Localization code (default: JP; all=every available language)");
         Console.WriteLine("  --dialog <id>        Export one dialog instead of all dialogs");
         Console.WriteLine("  --snapshot           Write <language>_snapshot<timestamp>.json");
     }
