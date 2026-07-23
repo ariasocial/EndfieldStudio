@@ -1770,7 +1770,33 @@ internal static class StoryExporter
                 };
             }
             if (hasTree)
+            {
                 scene["dialogTree"] = trees!.DeepClone();
+                if (!hasTimeline)
+                {
+                    // Dialogs without a Unity Timeline still carry their
+                    // authored order in the DialogTree graph. Preserve that
+                    // order instead of leaving the scene in numeric-ID
+                    // fallback order.
+                    var treeLineIds = trees!
+                        .OfType<JsonObject>()
+                        .SelectMany(tree => (tree["lineIds"] as JsonArray ?? new JsonArray())
+                            .Select(ScalarString))
+                        .Where(id => !string.IsNullOrWhiteSpace(id))
+                        .Cast<string>()
+                        .Distinct(StringComparer.OrdinalIgnoreCase)
+                        .ToArray();
+                    if (treeLineIds.Length > 0)
+                    {
+                        ReorderSceneLines(scene, treeLineIds);
+                        scene["order"] = new JsonObject
+                        {
+                            ["method"] = "DialogTree graph evidence",
+                            ["confidence"] = "authored",
+                        };
+                    }
+                }
+            }
         }
     }
 

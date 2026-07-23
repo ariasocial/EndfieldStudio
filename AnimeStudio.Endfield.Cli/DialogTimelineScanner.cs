@@ -7,9 +7,10 @@ namespace AnimeStudio.Endfield.Cli;
 
 /// <summary>
 /// Finds Timeline object graphs inside Bundle files and converts only the
-/// graph-shaped evidence needed by <see cref="DialogTimelineEvidence"/>.
+/// graph-shaped evidence needed by <see cref="DialogTimelineEvidence"/> and
+/// <see cref="CutsceneTimelineEvidence"/>.
 /// The scan is intentionally conservative: an object is never treated as a
-/// dialog line unless a serialized string contains a source-backed dlg_* ID.
+/// story line unless a serialized string contains a source-backed scene ID.
 /// </summary>
 internal static class DialogTimelineScanner
 {
@@ -121,7 +122,14 @@ internal static class DialogTimelineScanner
             if (info.classID == MonoBehaviourClassId)
             {
                 string name = ReadMonoBehaviourName(serializedFile, info, game);
-                if (name.Contains("dlgtl_", StringComparison.OrdinalIgnoreCase))
+                // Dialog timelines use dlgtl_* roots. Cutscene timelines use
+                // f_cutscene_*/m_cutscene_* (and sometimes black_*) roots,
+                // with Subtitle Track/PlayableAsset objects below them. The
+                // latter must be seeded here; they are not PlayableDirector
+                // objects and therefore cannot be found from that root alone.
+                if (name.Contains("dlgtl_", StringComparison.OrdinalIgnoreCase)
+                    || name.Contains("cutscene", StringComparison.OrdinalIgnoreCase)
+                    || name.StartsWith("black_", StringComparison.OrdinalIgnoreCase))
                     rootInfos.Add(info);
             }
             else if (info.classID == TextAssetClassId)

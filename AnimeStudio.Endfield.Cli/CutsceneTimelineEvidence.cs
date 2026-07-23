@@ -13,7 +13,7 @@ namespace AnimeStudio.Endfield.Cli;
 internal static class CutsceneTimelineEvidence
 {
     private static readonly Regex SceneLinePattern = new(
-        @"^(?<scene>(?:cutscene|black)_.+)_\d+(?:d\d+)?(?:_[fm])?$",
+        @"^(?<scene>(?:(?:f|m|fm)_)?(?:cutscene|cs_video|black)_.+)_\d+(?:d\d+)?(?:_[fm])?$",
         RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
 
     private static readonly Regex TextIdPropertyPattern = new(
@@ -21,7 +21,7 @@ internal static class CutsceneTimelineEvidence
         RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
 
     private static readonly Regex DirectSceneLinePattern = new(
-        @"^(?:cutscene|black)_.+_\d+(?:d\d+)?(?:_[fm])?$",
+        @"^(?:(?:f|m|fm)_)?(?:cutscene|cs_video|black)_.+_\d+(?:d\d+)?(?:_[fm])?$",
         RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
 
     public static Dictionary<string, JsonArray> Recover(IEnumerable<DialogTimelineRecord> input)
@@ -120,7 +120,18 @@ internal static class CutsceneTimelineEvidence
     {
         if (id.StartsWith("#", StringComparison.Ordinal)) return id;
         Match match = SceneLinePattern.Match(id);
-        return match.Success ? match.Groups["scene"].Value : "";
+        if (!match.Success) return "";
+
+        string scene = match.Groups["scene"].Value;
+        foreach (string prefix in new[] { "f_", "m_", "fm_" })
+            if (scene.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            {
+                scene = scene[prefix.Length..];
+                break;
+            }
+        if (scene.StartsWith("cs_video_", StringComparison.OrdinalIgnoreCase))
+            scene = "cutscene_" + scene[9..];
+        return scene;
     }
 
     private static void EnqueueReferences(
