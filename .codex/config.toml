@@ -1,4 +1,5 @@
 [sandbox_workspace_write]
 writable_roots = [
-    
+    "/home/kumi1/.dotnet"
+    "/home/kumi1/src/github.com/ariasocial/endfield-assets-extractor",
 ]
