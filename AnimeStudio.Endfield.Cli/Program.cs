@@ -14,6 +14,7 @@ using System.Runtime;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading.Channels;
+using AnimeStudio.Endfield.Cli.Story;
 
 namespace AnimeStudio.Endfield.Cli;
 
@@ -40,6 +41,9 @@ internal static class Program
           endfield-dump video   --vfs <streaming_assets_path> --out <dir> [--base-vfs <base_streaming_assets>]
                                 [--format mp4|usm] [--block all|video|auditvideo]
                                 [--ffmpeg <path>] [--threads N]
+          endfield-dump story   --vfs <streaming_assets_path> --out <dir> [--base-vfs <base_streaming_assets>]
+                                [--language <code|ALL>] (--mission <id> | --scene <id>)
+                                [--timeline off|full] [--scratch <dir>] [--overrides <json>] [--snapshot]
 
         Block types (case-insensitive). If omitted, all dumpable types are processed.
           InitialAudio, InitialBundle, InitialExtendData, BundleManifest, IFixPatch,
@@ -76,6 +80,7 @@ internal static class Program
                 "extract" => await RunExtract(args[1..]),
                 "audio" => RunAudio(args.AsSpan(1)),
                 "video" => RunVideo(args.AsSpan(1)),
+                "story" => StoryCommand.Run(args.AsSpan(1)),
                 "inspect-bundle" => RunInspectBundle(args.AsSpan(1)),
                 "find-bad-bundles" => RunFindBadBundles(args.AsSpan(1)),
                 "classify-bundles" => RunClassifyBundles(args.AsSpan(1)),

@@ -326,6 +326,15 @@ endfield-dump video --vfs ./StreamingAssets --out ./video \
 
 ffmpeg stream copy preserves original MPEG-2 video + HCA/ADX audio; no re-encoding.
 
+### Export story tables and graph evidence
+
+```bash
+endfield-dump story --vfs ./StreamingAssets --base-vfs ./BaseStreamingAssets \
+    --out ./story --language ALL --mission e11m7 --snapshot
+```
+
+The primary VFS overlays matching table rows from the base VFS. Each mission directory contains normalized `dlg`, `radio`, `remotecomm`, `sns`, `cutscene`, `cs_video`, and `black` scenes where available, localized views, raw evidence, and unresolved/disconnected nodes. LevelScript record-offset order and quest progression joined through trigger coordinates or tracked NPC dialog data are marked `inferred`; they are not promoted to `confirmed` without a decoded direct transition. Table-ID order is never treated as cross-scene chronology, and `sceneOrder.groups` retains partial order without inventing an order inside a group; cycles are retained as strongly connected components. `--timeline full` independently overlays primary and base Bundle metadata, scans DialogTree and Unity Timeline evidence, resolves numeric subtitle IDs back to unique TextTable rows, projects non-text DialogTree control nodes into line-to-line order, and preserves authored branch candidates. Option-to-response assignment is marked inferred while it relies on serialized option/connection positions rather than a decoded per-option port key. `cs_video_*` is treated as an FMV scene/action ID, not as a subtitle row with a removable numeric suffix. Cutscene locale/platform Timeline variants remain in raw evidence while `lineOrder` uses their consensus over stable text-row IDs; timing shifts between variants are not emitted as duplicate or parallel lines. `sourceOrder` retains the original table/index value while `resolvedOrder` and the compatibility `order` field contain the post-recovery array position; uncovered lines are reported separately. SNS order and branches come from `preContentId`, `nextContentId`, and option targets. Locale files contain both an ID dictionary and readable speaker/text/option scene views, write printable UTF-8 directly, and serialize 64-bit localization IDs as strings for JavaScript safety. Radio and remote-communication rows retain speaker and audio metadata. Locale files also report unavailable languages and missing localization IDs. The default `off` mode uses Table and JsonData evidence only and explicitly marks unsupported internal order as a fallback.
+
 ### Inspect resource distribution
 
 ```bash
@@ -342,6 +351,7 @@ endfield-dump inspect --vfs ./StreamingAssets --limit 50
 | `extract` | Stage 1 + 2 + 3 full pipeline, regex-export images                               |
 | `audio`   | Extract Wwise audio (WEM / WAV / MP3) with AudioDialog path mapping              |
 | `video`   | Extract videos (USM / MP4) via native demuxer + ffmpeg                           |
+| `story`   | Export normalized story tables, graph evidence, locales, and unresolved nodes    |
 
 ### extract Options
 
@@ -391,6 +401,23 @@ endfield-dump inspect --vfs ./StreamingAssets --limit 50
 | `--ffmpeg <path>` | auto     | Path to ffmpeg (auto-detected)       |
 | `--threads N`     | CPU      | Parallel conversion threads          |
 
+### story Options
+
+| Option                | Default | Description |
+| --------------------- | ------- | ----------- |
+| `--vfs <path>`        | required | Primary StreamingAssets directory |
+| `--base-vfs <path>`   | none | Base StreamingAssets rows overlaid by primary rows |
+| `--out <dir>`         | required | Story export directory |
+| `--language <code|ALL>` | JP | Locale export(s) |
+| `--mission <id>`      | required* | Mission id (*unless `--scene` can infer it) |
+| `--scene <id>`        | none | Restrict to one normalized scene id |
+| `--overrides <json>`  | none | Per-mission scene/graph patches |
+| `--snapshot`          | false | Include source/table metadata in the manifest |
+| `--timeline off|full` | off | Disable Timeline scanning or scan all Bundle files for DialogTree/Timeline evidence |
+| `--scratch <dir>`     | temp/endfield-story-timeline | Temporary directory used by the full Bundle scan |
+
+Either `--mission` or `--scene` is required. Automatic all-mission membership is deliberately disabled because external scene IDs cannot be assigned reliably from naming alone. `--timeline full` scans the complete Bundle block even when either filter is supplied; the filter limits retained evidence and output, not the number of Bundle candidates.
+
 ## Performance
 
 Measured on Ryzen 16-core, 64GB RAM, NVMe + tmpfs (/dev/shm) scratch.
@@ -425,4 +452,3 @@ End-to-end image extract: \~70× faster than upstream (524s vs \~10 hours estima
 - **AnimationClip export**: parsing works, but Endfield uses ACL-compressed buffers (`0xac11ac11` magic) for actual keyframe data. AnimeStudio only reads the raw bytes; full ACL decompression is not implemented. Exported metadata-only JSON is not useful without keyframes.
 - **Mesh export**: not implemented.
 - **Windows builds**: supported (Texture2DDecoder.Windows + Ooz.dll are included). Audio/video pipelines need Windows builds of vgmstream-cli and ffmpeg. macOS untested.
-
