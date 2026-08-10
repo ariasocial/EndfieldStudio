@@ -90,6 +90,26 @@ namespace AnimeStudio
             }
         }
 
+        /// <summary>
+        /// Loads one file from an already opened seekable stream. The caller keeps
+        /// ownership of <paramref name="stream"/>; readers created for bundle
+        /// members are released by <see cref="Clear"/>.
+        /// </summary>
+        public void LoadFileFromStream(string virtualPath, Stream stream)
+        {
+            if (string.IsNullOrWhiteSpace(virtualPath))
+                throw new ArgumentException("A virtual path is required.", nameof(virtualPath));
+            if (stream == null)
+                throw new ArgumentNullException(nameof(stream));
+            if (!stream.CanRead || !stream.CanSeek)
+                throw new ArgumentException("The input stream must be readable and seekable.", nameof(stream));
+
+            stream.Position = 0;
+            var reader = new FileReader(virtualPath, stream, leaveOpen: true);
+            reader = reader.PreProcessing(Game);
+            LoadFile(reader);
+        }
+
         public void LoadFolder(string path)
         {
             if (Silent)

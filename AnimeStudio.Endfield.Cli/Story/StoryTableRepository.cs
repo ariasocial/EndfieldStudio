@@ -14,28 +14,32 @@ internal sealed class StoryTableRepository
     public List<StoryEvidence> Evidence { get; } = [];
     public List<string> Warnings { get; } = [];
 
-    public static StoryTableRepository Load(StoryCommand.Options options)
+    public static StoryTableRepository Load(StoryCommand.Options options, bool tablesOnly = false)
     {
         var repository = new StoryTableRepository();
+        string? missionFilter = options.Mission?.Equals("all", StringComparison.OrdinalIgnoreCase) == true
+            ? null
+            : options.Mission;
         // Load base rows first, then overlay primary rows. The primary loader
         // still needs base as a physical chunk fallback because Persistent
         // metadata may intentionally reference unchanged StreamingAssets chunks.
-        if (!string.IsNullOrWhiteSpace(options.BaseVfsPath)) repository.LoadSource(options.BaseVfsPath, null, "base", options.Mission);
-        repository.LoadSource(options.VfsPath!, options.BaseVfsPath, "primary", options.Mission);
+        if (!string.IsNullOrWhiteSpace(options.BaseVfsPath)) repository.LoadSource(options.BaseVfsPath, null, "base", missionFilter, options.Language, tablesOnly);
+        repository.LoadSource(options.VfsPath!, options.BaseVfsPath, "primary", missionFilter, options.Language, tablesOnly);
         return repository;
     }
 
     public JsonObject Table(string name) => Tables.TryGetValue(name, out var table) ? table : new JsonObject();
 
-    private void LoadSource(string path, string? chunkFallbackPath, string source, string? missionFilter)
+    private void LoadSource(string path, string? chunkFallbackPath, string source, string? missionFilter, string language, bool tablesOnly)
     {
         var loader = new VfsLoader(path, Keys.ChaCha20Key, chunkFallbackPath);
-        LoadTables(loader, source);
+        LoadTables(loader, source, language);
+        if (tablesOnly) return;
         LoadRuntimeAssets(loader, source, missionFilter);
         LoadLevelScripts(loader, source, missionFilter);
     }
 
-    private void LoadTables(VfsLoader loader, string source)
+    private void LoadTables(VfsLoader loader, string source, string language)
     {
         BlockMainInfo info;
         try { info = loader.LoadBlockInfo(BlockType.Table); }
@@ -47,7 +51,7 @@ internal sealed class StoryTableRepository
             try
             {
                 var (name, json) = SparkBuffer.Parse(loader.ExtractFileToBytes(BlockType.Table, chunk, file));
-                if (!IsStoryTable(name) || JsonNode.Parse(json) is not JsonObject rows) continue;
+                if (!IsStoryTable(name, language) || JsonNode.Parse(json) is not JsonObject rows) continue;
                 if (!Tables.TryGetValue(name, out JsonObject? target)) Tables[name] = target = new JsonObject();
                 foreach (var row in rows) target[row.Key] = row.Value?.DeepClone();
             }
@@ -130,10 +134,11 @@ internal sealed class StoryTableRepository
                          || string.Equals(Scalar(e.Detail?["missionId"]), missionFilter, StringComparison.OrdinalIgnoreCase))).ToArray())
         {
             string? uniqueId = Scalar(condition.Detail?["uniqueId"]);
+            string? conditionMission = Scalar(condition.Detail?["missionId"]);
             if (string.IsNullOrWhiteSpace(uniqueId) || !text.Contains(uniqueId, StringComparison.OrdinalIgnoreCase)) continue;
             foreach (string scene in scenes)
             {
-                if (!string.IsNullOrWhiteSpace(missionFilter) && ContainsDifferentMissionId(scene, missionFilter)) continue;
+                if (!string.IsNullOrWhiteSpace(conditionMission) && ContainsDifferentMissionId(scene, conditionMission)) continue;
                 Evidence.Add(new StoryEvidence("trigger-scene-link", source, file, scene,
                     new JsonObject
                     {
@@ -163,34 +168,69 @@ internal sealed class StoryTableRepository
                 var decoded = LevelScriptEvidence.Decode(data)
                     .Select(chain => (Chain: chain, Hits: LevelScriptEvidence.SceneKeys(chain, null)))
                     .ToArray();
+                string[] fileMissions = decoded
+                    .SelectMany(item => item.Hits)
+                    .Select(hit => EmbeddedMission(hit.SceneId))
+                    .OfType<string>()
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToArray();
                 bool relatedFile = string.IsNullOrWhiteSpace(missionFilter)
                     || decoded.SelectMany(item => item.Hits).Any(hit => Belongs(hit.SceneId, missionFilter));
                 if (!relatedFile) continue;
                 AddBinaryStoryReferences(data, source, file.FileName, "level-script-file-ref", missionFilter, groupLevelData: true);
-                AddLevelScriptPositionEvidence(data, source, file.FileName, missionFilter);
+                AddLevelScriptPositionEvidence(data, source, file.FileName, missionFilter, fileMissions);
                 int chainIndex = 0;
                 foreach (var item in decoded)
                 {
+                    string[] chainMissions = item.Hits
+                        .Select(hit => EmbeddedMission(hit.SceneId))
+                        .OfType<string>()
+                        .Distinct(StringComparer.OrdinalIgnoreCase)
+                        .ToArray();
                     bool chainBelongs = string.IsNullOrWhiteSpace(missionFilter)
                         || item.Hits.Any(hit => Belongs(hit.SceneId, missionFilter));
                     foreach (var hit in item.Hits)
                     {
+                        if (string.IsNullOrWhiteSpace(missionFilter))
+                        {
+                            string? embeddedMission = EmbeddedMission(hit.SceneId);
+                            string[] attributedMissions = embeddedMission is not null
+                                ? [embeddedMission]
+                                : chainMissions.Length > 0 ? chainMissions : fileMissions;
+                            if (attributedMissions.Length == 0)
+                            {
+                                AddLevelScriptEvidence(source, file.FileName, chainIndex, hit.SceneId, hit.Offset, null,
+                                    "LevelScriptData reference; mission membership unresolved");
+                            }
+                            else
+                            {
+                                string membershipEvidence = embeddedMission is not null
+                                    ? "scene id"
+                                    : chainMissions.Length > 0
+                                        ? "same decoded LevelScript action chain as mission scene"
+                                        : "same LevelScriptData file; no conflicting explicit mission id";
+                                foreach (string attributedMission in attributedMissions)
+                                    AddLevelScriptEvidence(source, file.FileName, chainIndex, hit.SceneId, hit.Offset,
+                                        attributedMission, membershipEvidence);
+                            }
+                            continue;
+                        }
                         bool directMission = string.IsNullOrWhiteSpace(missionFilter) || Belongs(hit.SceneId, missionFilter);
                         bool relatedByChain = !directMission && chainBelongs && !ContainsDifferentMissionId(hit.SceneId, missionFilter!);
                         bool relatedByFile = !directMission && !relatedByChain && relatedFile && !ContainsDifferentMissionId(hit.SceneId, missionFilter!);
-                        Evidence.Add(new StoryEvidence("level-script", source, file.FileName, hit.SceneId,
-                            new JsonObject
-                            {
-                                ["chain"] = chainIndex,
-                                ["offset"] = hit.Offset,
-                                ["missionId"] = directMission || relatedByChain || relatedByFile ? missionFilter : null,
-                                ["coOccurrenceMissionId"] = directMission || relatedByChain || relatedByFile ? null : missionFilter,
-                                ["membershipEvidence"] = directMission
-                                    ? "scene id"
-                                    : relatedByChain ? "same decoded LevelScript action chain as mission scene"
-                                    : relatedByFile ? "same LevelScriptData file; no conflicting explicit mission id"
-                                    : "LevelScriptData file co-occurrence only",
-                            }));
+                        AddLevelScriptEvidence(
+                            source,
+                            file.FileName,
+                            chainIndex,
+                            hit.SceneId,
+                            hit.Offset,
+                            directMission || relatedByChain || relatedByFile ? missionFilter : null,
+                            directMission
+                                ? "scene id"
+                                : relatedByChain ? "same decoded LevelScript action chain as mission scene"
+                                : relatedByFile ? "same LevelScriptData file; no conflicting explicit mission id"
+                                : "LevelScriptData file co-occurrence only",
+                            directMission || relatedByChain || relatedByFile ? null : missionFilter);
                     }
                     chainIndex++;
                 }
@@ -199,7 +239,30 @@ internal sealed class StoryTableRepository
         }
     }
 
-    private static bool IsStoryTable(string name) => TableNames.Contains(name, StringComparer.Ordinal) || name.StartsWith("I18nTextTable_", StringComparison.OrdinalIgnoreCase);
+    private void AddLevelScriptEvidence(
+        string source,
+        string file,
+        int chain,
+        string sceneId,
+        int offset,
+        string? missionId,
+        string membershipEvidence,
+        string? coOccurrenceMissionId = null)
+        => Evidence.Add(new StoryEvidence("level-script", source, file, sceneId,
+            new JsonObject
+            {
+                ["chain"] = chain,
+                ["offset"] = offset,
+                ["missionId"] = missionId,
+                ["coOccurrenceMissionId"] = coOccurrenceMissionId,
+                ["membershipEvidence"] = membershipEvidence,
+            }));
+
+    private static bool IsStoryTable(string name, string language)
+        => TableNames.Contains(name, StringComparer.Ordinal)
+            || name.StartsWith("I18nTextTable_", StringComparison.OrdinalIgnoreCase)
+                && (language.Equals("ALL", StringComparison.OrdinalIgnoreCase)
+                    || name.Equals("I18nTextTable_" + language, StringComparison.OrdinalIgnoreCase));
     private static string Decode(byte[] data) => Encoding.UTF8.GetString(data.AsSpan(data.Length >= 3 && data[0] == 0xEF && data[1] == 0xBB && data[2] == 0xBF ? 3 : 0));
 
     private void AddBinaryStoryReferences(byte[] data, string source, string file, string kind, string? missionFilter, bool groupLevelData)
@@ -210,48 +273,113 @@ internal sealed class StoryTableRepository
                 System.Text.RegularExpressions.RegexOptions.IgnoreCase)
             .Cast<System.Text.RegularExpressions.Match>()
             .ToArray();
+        string[] fileMissions = matches
+            .Select(match => EmbeddedMission(match.Value))
+            .OfType<string>()
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
         bool relatedFile = groupLevelData && !string.IsNullOrWhiteSpace(missionFilter)
             && (file.Contains(missionFilter, StringComparison.OrdinalIgnoreCase)
                 || matches.Any(match => Belongs(match.Value, missionFilter)));
         foreach (var match in matches)
         {
-            bool directMission = !string.IsNullOrWhiteSpace(missionFilter) && Belongs(match.Value, missionFilter);
-            Evidence.Add(new StoryEvidence(kind, source, file, match.Value,
-                new JsonObject
+            if (string.IsNullOrWhiteSpace(missionFilter))
+            {
+                string? embeddedMission = EmbeddedMission(match.Value);
+                string[] attributedMissions = embeddedMission is not null
+                    ? [embeddedMission]
+                    : groupLevelData ? fileMissions : [];
+                if (attributedMissions.Length == 0)
                 {
-                    ["offset"] = match.Index,
-                    ["missionId"] = directMission ? missionFilter : null,
-                    ["coOccurrenceMissionId"] = relatedFile && !directMission ? missionFilter : null,
-                    ["membershipEvidence"] = directMission ? "scene id" : relatedFile ? "file co-occurrence only" : null,
-                }));
+                    AddBinaryStoryReference(kind, source, file, match.Value, match.Index, null, null, null);
+                }
+                else
+                {
+                    foreach (string attributedMission in attributedMissions)
+                        AddBinaryStoryReference(
+                            kind,
+                            source,
+                            file,
+                            match.Value,
+                            match.Index,
+                            embeddedMission is not null ? attributedMission : null,
+                            embeddedMission is null ? attributedMission : null,
+                            embeddedMission is not null ? "scene id" : "file co-occurrence only");
+                }
+                continue;
+            }
+            bool directMission = !string.IsNullOrWhiteSpace(missionFilter) && Belongs(match.Value, missionFilter);
+            AddBinaryStoryReference(
+                kind,
+                source,
+                file,
+                match.Value,
+                match.Index,
+                directMission ? missionFilter : null,
+                relatedFile && !directMission ? missionFilter : null,
+                directMission ? "scene id" : relatedFile ? "file co-occurrence only" : null);
         }
     }
+
+    private void AddBinaryStoryReference(
+        string kind,
+        string source,
+        string file,
+        string sceneId,
+        int offset,
+        string? missionId,
+        string? coOccurrenceMissionId,
+        string? membershipEvidence)
+        => Evidence.Add(new StoryEvidence(kind, source, file, sceneId,
+            new JsonObject
+            {
+                ["offset"] = offset,
+                ["missionId"] = missionId,
+                ["coOccurrenceMissionId"] = coOccurrenceMissionId,
+                ["membershipEvidence"] = membershipEvidence,
+            }));
 
     private static bool Belongs(string id, string mission)
         => id.Contains($"_{mission}_", StringComparison.OrdinalIgnoreCase)
             || id.EndsWith("_" + mission, StringComparison.OrdinalIgnoreCase);
 
+    private static string? EmbeddedMission(string id)
+    {
+        System.Text.RegularExpressions.Match match = System.Text.RegularExpressions.Regex.Match(
+            id,
+            @"(?:^|_)(?<mission>[a-z]+\d+(?:l\d+)*m\d+(?:d\d+)?)(?:_|$)",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        return match.Success ? match.Groups["mission"].Value : null;
+    }
+
     private static bool ContainsDifferentMissionId(string id, string mission)
-        => System.Text.RegularExpressions.Regex.Matches(id, @"(?:^|_)[a-z]\d+m\d+(?:d\d+)?(?:_|$)", System.Text.RegularExpressions.RegexOptions.IgnoreCase)
+        => System.Text.RegularExpressions.Regex.Matches(id, @"(?:^|_)[a-z]+\d+(?:l\d+)*m\d+(?:d\d+)?(?:_|$)", System.Text.RegularExpressions.RegexOptions.IgnoreCase)
             .Cast<System.Text.RegularExpressions.Match>()
             .Select(match => match.Value.Trim('_'))
             .Any(value => !value.Equals(mission, StringComparison.OrdinalIgnoreCase));
 
-    private void AddLevelScriptPositionEvidence(byte[] data, string source, string file, string? missionFilter)
+    private void AddLevelScriptPositionEvidence(
+        byte[] data,
+        string source,
+        string file,
+        string? missionFilter,
+        IReadOnlyCollection<string> fileMissions)
     {
         string text = Encoding.UTF8.GetString(data);
         string[] scenes = StoryIds(text).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
         if (scenes.Length == 0) return;
         foreach (StoryEvidence tracking in Evidence.Where(e => e.Kind == "quest-tracking-position"
                      && (string.IsNullOrWhiteSpace(missionFilter)
-                         || string.Equals(Scalar(e.Detail?["missionId"]), missionFilter, StringComparison.OrdinalIgnoreCase))).ToArray())
+                         ? fileMissions.Contains(Scalar(e.Detail?["missionId"]) ?? string.Empty, StringComparer.OrdinalIgnoreCase)
+                         : string.Equals(Scalar(e.Detail?["missionId"]), missionFilter, StringComparison.OrdinalIgnoreCase))).ToArray())
         {
+            string? trackingMission = Scalar(tracking.Detail?["missionId"]);
             if (!Float(tracking.Detail?["x"], out float x) || !Float(tracking.Detail?["y"], out float y) || !Float(tracking.Detail?["z"], out float z)) continue;
             int offset = FindVector3(data, x, y, z);
             if (offset < 0) continue;
             foreach (string scene in scenes)
             {
-                if (!string.IsNullOrWhiteSpace(missionFilter) && ContainsDifferentMissionId(scene, missionFilter)) continue;
+                if (!string.IsNullOrWhiteSpace(trackingMission) && ContainsDifferentMissionId(scene, trackingMission)) continue;
                 Evidence.Add(new StoryEvidence("trigger-scene-link", source, file, scene,
                     new JsonObject
                     {

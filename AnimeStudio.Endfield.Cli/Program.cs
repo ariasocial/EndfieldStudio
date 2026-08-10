@@ -42,8 +42,12 @@ internal static class Program
                                 [--format mp4|usm] [--block all|video|auditvideo]
                                 [--ffmpeg <path>] [--threads N]
           endfield-dump story   --vfs <streaming_assets_path> --out <dir> [--base-vfs <base_streaming_assets>]
-                                [--language <code|ALL>] (--mission <id> | --scene <id>)
-                                [--timeline off|full] [--scratch <dir>] [--overrides <json>] [--snapshot]
+                                [--language <code|ALL>] [--timeline off|quick|full]
+                                [--threads N] [--timeline-index <dir>] [--rebuild-timeline-index]
+                                (--mission <id|all> | --scene <id>)
+                                [--no-timeline-index] [--scratch <dir>] [--overrides <json>] [--snapshot]
+          endfield-dump story   --vfs <streaming_assets_path> [--base-vfs <base_streaming_assets>]
+                                --list-missions [--language <code|ALL>]
 
         Block types (case-insensitive). If omitted, all dumpable types are processed.
           InitialAudio, InitialBundle, InitialExtendData, BundleManifest, IFixPatch,

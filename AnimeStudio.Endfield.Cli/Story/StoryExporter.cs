@@ -31,20 +31,38 @@ internal static class StoryExporter
             ? repository.Tables.Keys.Where(n => n.StartsWith("I18nTextTable_", StringComparison.OrdinalIgnoreCase)).Select(n => n["I18nTextTable_".Length..]).Order().ToList()
             : [options.Language];
         if (languages.Count == 0) languages.Add("JP");
-        string? requestedMission = options.Mission;
+        bool exportAll = options.Mission?.Equals("all", StringComparison.OrdinalIgnoreCase) == true;
+        string? requestedMission = exportAll ? null : options.Mission;
         if (requestedMission is null && options.Scene is not null)
             requestedMission = ParseScene(options.Scene)?.Mission ?? MissionFromId(Normalize(options.Scene));
-        if (requestedMission is null)
+        if (requestedMission is null && !exportAll)
             throw new ArgumentException($"Could not infer a mission from --scene {options.Scene}; specify --mission as well.");
-        var missionIds = MissionIds(repository, requestedMission);
+        var missionIds = exportAll
+            ? StoryMissionCatalog.ListedMissionIds(repository)
+            : MissionIds(repository, requestedMission);
         if (missionIds.Count == 0) throw new InvalidOperationException("No matching story scenes were found.");
         StoryTimelineScanResult? timeline = null;
-        if (options.Timeline == "full")
+        string? timelineIndexPath = null;
+        if (options.Timeline is "full" or "quick")
         {
             string scratch = options.Scratch ?? Path.Combine(Path.GetTempPath(), "endfield-story-timeline");
+            timelineIndexPath = options.DisableTimelineIndex
+                ? null
+                : options.TimelineIndex ?? Path.Combine(options.OutputPath!, ".timeline-index");
             try
             {
-                timeline = StoryTimelineScanner.Scan(options.VfsPath!, options.BaseVfsPath, scratch, requestedMission);
+                timeline = StoryTimelineScanner.Scan(
+                    options.VfsPath!,
+                    options.BaseVfsPath,
+                    scratch,
+                    requestedMission,
+                    options.Timeline,
+                    timelineIndexPath,
+                    options.RebuildTimelineIndex,
+                    options.Threads);
+                if (options.Timeline == "full" && timeline.BundlesFailed > 0)
+                    repository.Warnings.Add(
+                        $"Full Timeline evidence is incomplete because {timeline.BundlesFailed:N0} Bundle file(s) could not be read.");
             }
             catch (Exception ex)
             {
@@ -53,12 +71,12 @@ internal static class StoryExporter
         }
         int written = 0;
         foreach (string mission in missionIds)
-            if (WriteMission(repository, overrides, options, mission, languages, timeline)) written++;
+            if (WriteMission(repository, overrides, options, mission, languages, timeline, timelineIndexPath)) written++;
         if (written == 0) throw new InvalidOperationException("No matching story scenes were found.");
         Console.WriteLine($"Wrote {written:N0} mission story export(s) to {Path.GetFullPath(options.OutputPath!)}");
     }
 
-    private static List<string> MissionIds(StoryTableRepository repo, string? requested)
+    internal static List<string> MissionIds(StoryTableRepository repo, string? requested)
     {
         var ids = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (string id in repo.Table("DialogTextTable").Select(p => p.Key)) if (DialogLine.Match(id) is { Success: true } m) ids.Add(m.Groups["mission"].Value);
@@ -70,7 +88,14 @@ internal static class StoryExporter
         return ids.Where(id => requested is null || id.Equals(requested, StringComparison.OrdinalIgnoreCase)).Order(StringComparer.OrdinalIgnoreCase).ToList();
     }
 
-    private static bool WriteMission(StoryTableRepository repo, JsonObject overrides, StoryCommand.Options options, string mission, List<string> languages, StoryTimelineScanResult? timeline)
+    private static bool WriteMission(
+        StoryTableRepository repo,
+        JsonObject overrides,
+        StoryCommand.Options options,
+        string mission,
+        List<string> languages,
+        StoryTimelineScanResult? timeline,
+        string? timelineIndexPath)
     {
         var scenes = BuildScenes(repo, mission, options.Scene, timeline);
         if (scenes.Count == 0) return false;
@@ -89,6 +114,15 @@ internal static class StoryExporter
                 ["bundlesFailed"] = timeline.BundlesFailed,
                 ["rootsFound"] = timeline.RootsFound,
                 ["graphObjectsRead"] = timeline.GraphObjectsRead,
+                ["bundleCandidates"] = timeline.BundleCandidates,
+                ["bundlesReused"] = timeline.BundlesReused,
+                ["bundlesChanged"] = timeline.BundlesChanged,
+                ["bundlesQuickSkipped"] = timeline.BundlesQuickSkipped,
+                ["coverage"] = options.Timeline == "quick"
+                    ? "candidate-only"
+                    : timeline.BundlesFailed == 0 ? "complete" : "incomplete",
+                ["complete"] = options.Timeline == "full" && timeline.BundlesFailed == 0,
+                ["indexPath"] = timelineIndexPath is null ? null : Path.GetFullPath(timelineIndexPath),
             };
         if (overrideSummary is not null && options.Overrides is not null)
             manifest["override"] = new JsonObject
@@ -838,8 +872,10 @@ internal static class StoryExporter
     private static bool Belongs(string id, string mission) => id.Contains($"_{mission}_", StringComparison.OrdinalIgnoreCase) || id.EndsWith("_" + mission, StringComparison.OrdinalIgnoreCase);
     private static bool EvidenceBelongs(StoryEvidence evidence, string mission)
     {
-        return evidence.SceneId is not null && Belongs(evidence.SceneId, mission)
-            || string.Equals(Scalar(evidence.Detail?["missionId"]), mission, StringComparison.OrdinalIgnoreCase);
+        string? evidenceMission = Scalar(evidence.Detail?["missionId"]);
+        return !string.IsNullOrWhiteSpace(evidenceMission)
+            ? string.Equals(evidenceMission, mission, StringComparison.OrdinalIgnoreCase)
+            : evidence.SceneId is not null && Belongs(evidence.SceneId, mission);
     }
     private static int? Int(string? value) => int.TryParse(value, out int n) ? n : null;
     private static double? Number(JsonNode? node)
